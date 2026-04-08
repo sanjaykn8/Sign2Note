@@ -1,6 +1,20 @@
-mediapipe
-numpy
+# Core ML
+torch>=2.0.0
+torchvision
+# Feature extraction
+mediapipe>=0.10.0
 opencv-python
+numpy
+# Data
+pandas
 tqdm
-onnxruntime-gpu
-fastapi uvicorn[standard]
+# ONNX export/runtime
+onnx
+onnxruntime          # CPU runtime
+# onnxruntime-gpu    # uncomment if CUDA available
+# API service
+fastapi
+uvicorn[standard]
+python-multipart
+# HTTP (Ollama fallback)
+requests

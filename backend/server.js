@@ -1,22 +1,18 @@
 // backend/server.js
-const express = require('express');
-const multer = require('multer');
-const fetch = require('node-fetch');
-const fs = require('fs');
-const path = require('path');
-const cors = require('cors');
+const express   = require('express');
+const multer    = require('multer');
+const fetch     = require('node-fetch');
+const FormData  = require('form-data');
+const fs        = require('fs');
+const path      = require('path');
+const cors      = require('cors');
 
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, UPLOAD_DIR)
-  },
-  filename: function (req, file, cb) {
-    const unique = Date.now() + '-' + file.originalname;
-    cb(null, unique);
-  }
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename:    (req, file, cb) => cb(null, Date.now() + '-' + file.originalname),
 });
 const upload = multer({ storage });
 
@@ -24,19 +20,18 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ML_SERVICE_URL = "http://127.0.0.1:8000/process"; // FastAPI endpoint
+const ML_SERVICE_URL = 'http://127.0.0.1:8000/process';
 
 app.post('/upload', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: "no file" });
-  const formData = new (require('form-data'))();
-  formData.append('file', fs.createReadStream(req.file.path));
-  formData.append('use_llama', req.body.use_llama ? 'true' : 'false');
+  if (!req.file) return res.status(400).json({ error: 'no file' });
+
+  const fd = new FormData();
+  fd.append('file',       fs.createReadStream(req.file.path), req.file.originalname);
+  fd.append('use_llama',  req.body.use_llama  === 'true' ? 'true' : 'false');
+  fd.append('use_ollama', req.body.use_ollama === 'true' ? 'true' : 'false');
 
   try {
-    const r = await fetch(ML_SERVICE_URL, {
-      method: 'POST',
-      body: formData
-    });
+    const r    = await fetch(ML_SERVICE_URL, { method: 'POST', body: fd });
     const json = await r.json();
     return res.json(json);
   } catch (err) {
@@ -45,6 +40,6 @@ app.post('/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
-  console.log("Backend listening on http://localhost:3000");
-});
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+app.listen(3001, () => console.log('Backend listening on http://localhost:3001'));
