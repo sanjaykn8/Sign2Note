@@ -43,9 +43,9 @@ data/
 ```bash
 cd ml_service
 python feature_extraction.py \
-  --videos_dir ./data/wlasl/videos \
+  --videos_dir data/wlasl/videos \
   --out_dir    data/features \
-  --wlasl_json ./data/wlasl/WLASL_v0.3.json \
+  --wlasl_json data/wlasl/WLASL_v0.3.json \
   --frame_skip 8 \
   --workers    8
 ```
