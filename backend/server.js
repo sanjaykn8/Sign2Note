@@ -35,7 +35,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     contentType: req.file.mimetype || 'video/mp4',
   });
   fd.append('notes_mode', req.body.notes_mode || 'template');
-  fd.append('ollama_model', req.body.ollama_model || 'llama3.2:3b');
+  fd.append('llm_model', req.body.llm_model || 'gemma4');
   fd.append('style', req.body.style || 'concise');
   fd.append('frame_skip', req.body.frame_skip || '8');
   fd.append('stride', req.body.stride || '12');

@@ -1,10 +1,19 @@
 import type { ProcessResult } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { FileText, Hand } from "lucide-react";
+import { FileText, Hand, AlertTriangle } from "lucide-react";
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
 
 function renderMarkdown(md: string): string {
-  return md
+  return escapeHtml(md)
     .replace(/^### (.+)$/gm, "<h3 class='text-base font-semibold mt-4 mb-1'>$1</h3>")
     .replace(/^## (.+)$/gm, "<h2 class='text-lg font-bold mt-5 mb-2'>$1</h2>")
     .replace(/^# (.+)$/gm, "<h1 class='text-xl font-bold mt-6 mb-2'>$1</h1>")
@@ -25,6 +34,12 @@ export default function ResultsPanel({ result }: { result: ProcessResult }) {
             <CardTitle className="flex items-center gap-2 text-base">
               <Hand className="h-5 w-5 text-accent" />
               Detected Signs
+              {result.low_confidence && (
+                <Badge variant="outline" className="ml-auto gap-1 text-xs font-normal text-amber-600 border-amber-500/40">
+                  <AlertTriangle className="h-3 w-3" />
+                  Low confidence
+                </Badge>
+              )}
             </CardTitle>
           </CardHeader>
           <CardContent className="flex flex-wrap gap-2">

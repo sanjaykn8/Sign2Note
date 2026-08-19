@@ -5,11 +5,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from openai import OpenAI
 
 from inference_viterbi import viterbi_decode
 from model import TemporalCNN
-from notes_generator import template_notes_from_tokens
+from notes_generator import build_notes_prompt, template_notes_from_tokens
 
 try:
     import onnxruntime as ort
@@ -20,8 +19,21 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DEFAULT_CHECKPOINT = Path("models/sign_recog/checkpoints/demo.pt")
 DEFAULT_ONNX = Path("models/sign_recog/sign_recog.onnx")
 
+# llama.cpp's `llama-server` exposes an OpenAI-compatible endpoint at this URL.
+# Only imported/connected to lazily, inside generate_llama_cpp_notes(), so that
+# template mode keeps working even if `openai` isn't installed or the server
+# isn't running.
 LLAMA_CPP_URL = "http://127.0.0.1:8081/v1"
-_llama_client = OpenAI(base_url=LLAMA_CPP_URL, api_key="not-needed")
+_llama_client = None
+
+
+def _get_llama_client():
+    global _llama_client
+    if _llama_client is None:
+        from openai import OpenAI
+        _llama_client = OpenAI(base_url=LLAMA_CPP_URL, api_key="not-needed")
+    return _llama_client
+
 
 _torch_cache = None
 _onnx_cache = None
@@ -124,25 +136,14 @@ def predict_from_features(feature_path, checkpoint_path=None, onnx_path=None,
 
 def generate_llama_cpp_notes(gloss_list, model="gemma4", style="concise"):
     """Call the local llama.cpp server (OpenAI-compatible endpoint) to turn
-    a gloss sequence into notes."""
-    prompt = f"""
-You are the language reconstruction component of Sign2Notes.
-Convert the recognized sign glosses into coherent notes.
+    a gloss sequence into notes. Requires `llama-server` running locally and
+    the `openai` package installed (pip install openai)."""
+    if not gloss_list:
+        raise ValueError("gloss_list is empty")
 
-Recognized glosses:
-{", ".join(gloss_list)}
-
-Style:
-{style}
-
-Rules:
-- Preserve the meaning of the recognized signs.
-- Do not invent facts.
-- Do not add information that is not supported by the glosses.
-- Correct obvious grammatical ordering.
-- Produce concise, readable notes.
-"""
-    response = _llama_client.chat.completions.create(
+    client = _get_llama_client()
+    prompt = build_notes_prompt(gloss_list, style=style)
+    response = client.chat.completions.create(
         model=model,
         messages=[
             {
@@ -160,15 +161,33 @@ Rules:
         temperature=0.2,
         max_tokens=300,
     )
-    return response.choices[0].message.content.strip()
+    text = (response.choices[0].message.content or "").strip()
+    if not text:
+        raise RuntimeError("llama.cpp server returned an empty response")
+    return text
 
 
-def generate_notes(gloss_list, mode="template", ollama_model="gemma4", style="concise"):
+def generate_notes(gloss_list, mode="template", llm_model="gemma4", style="concise", **_legacy_kwargs):
+    """Turn a gloss sequence into notes.
+
+    mode="template"  -> deterministic, always available, no network/LLM needed.
+    mode="llama_cpp" -> calls the local llama-server; falls back to template
+                        notes on any failure (server down, model not loaded,
+                        openai package missing, etc.) so the API never 500s
+                        just because the LLM backend is unreachable.
+
+    `_legacy_kwargs` swallows the old `ollama_model=` keyword so any caller
+    still using the previous name doesn't crash — pass ollama_model=X and
+    it's used as llm_model if llm_model wasn't given explicitly.
+    """
+    if "ollama_model" in _legacy_kwargs and llm_model == "gemma4":
+        llm_model = _legacy_kwargs["ollama_model"]
+
     if mode in ("llama_cpp", "ollama"):
         try:
-            return generate_llama_cpp_notes(gloss_list, model=ollama_model, style=style)
+            return generate_llama_cpp_notes(gloss_list, model=llm_model, style=style)
         except Exception as e:
-            print(f"[infer] llama.cpp server unavailable: {e}; template fallback")
+            print(f"[infer] llama.cpp server unavailable: {e}; falling back to template notes")
     return template_notes_from_tokens(gloss_list)
 
 
@@ -204,4 +223,4 @@ if __name__ == "__main__":
         raise SystemExit("Provide --feature_path or --video_path")
 
     print(result)
-    print(generate_notes(result["gloss_list"], mode=args.notes_mode, ollama_model=args.llm_model))
+    print(generate_notes(result["gloss_list"], mode=args.notes_mode, llm_model=args.llm_model))

@@ -1,5 +1,6 @@
 import os
 import tempfile
+from collections import Counter
 from pathlib import Path
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,7 +23,7 @@ ONNX = BASE / "models/sign_recog/sign_recog.onnx"
 TMP = BASE / "data/tmp"
 TMP.mkdir(parents=True, exist_ok=True)
 
-LLAMA_CPP_URL = "http://127.0.0.1:8081"
+LLAMA_CPP_URL = "http://127.0.0.1:8080"
 
 
 @app.get("/health")
@@ -35,6 +36,19 @@ def health():
     }
 
 
+def _best_guess_gloss(segments):
+    """Fallback for when no window crosses the confidence threshold:
+    majority-vote the raw per-window predictions (ignoring the threshold)
+    and return the single most-predicted label. Always returns a
+    non-empty list as long as at least one window was processed, so the
+    API never has to hand back an empty result."""
+    if not segments:
+        return []
+    counts = Counter(s["label"] for s in segments)
+    top_label, _ = counts.most_common(1)[0]
+    return [top_label]
+
+
 @app.post("/process")
 async def process_upload(
     file: UploadFile = File(...),
@@ -43,7 +57,7 @@ async def process_upload(
     style: str = Form("concise"),
     frame_skip: int = Form(8),
     stride: int = Form(12),
-    threshold: float = Form(0.55),
+    threshold: float = Form(0.05),
 ):
     if not CHECKPOINT.exists() and not ONNX.exists():
         return JSONResponse({"error": "No trained model found. Run build_index.py and train.py first."}, 500)
@@ -71,16 +85,25 @@ async def process_upload(
             threshold=threshold,
         )
 
+        low_confidence = False
         if not result["gloss_list"]:
-            return JSONResponse({
-                "notes_md": "# Sign2Notes\n\nNo confident signs detected. Please repeat the gesture.",
-                "gloss_list": [], "segments": result["segments"],
-                "confidence": result["top_confidence"], "backend": result["backend"],
-            })
+            # No window crossed `threshold`. Instead of returning an empty
+            # result, fall back to a best-guess label via majority vote
+            # across all windows' raw predictions, so the pipeline always
+            # commits to a sign rather than dead-ending on the user.
+            top = sorted(result["segments"], key=lambda s: -s["confidence"])[:5]
+            print(
+                f"[api] No window crossed threshold={threshold} "
+                f"(mean top confidence={result['top_confidence']:.3f}); "
+                f"falling back to best guess. Top windows: "
+                f"{[(s['label'], round(s['confidence'], 3)) for s in top]}"
+            )
+            result["gloss_list"] = _best_guess_gloss(result["segments"])
+            low_confidence = True
 
         notes = generate_notes(
             result["gloss_list"], mode=notes_mode,
-            ollama_model=llm_model, style=style,
+            llm_model=llm_model, style=style,
         )
 
         return {
@@ -90,6 +113,7 @@ async def process_upload(
             "confidence": result["top_confidence"],
             "backend": result["backend"],
             "providers": result["providers"],
+            "low_confidence": low_confidence,
         }
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, 500)

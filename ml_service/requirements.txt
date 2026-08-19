@@ -16,5 +16,7 @@ onnxruntime          # CPU runtime
 fastapi
 uvicorn[standard]
 python-multipart
-# HTTP (Ollama fallback)
-requests
+# LLM notes backend (talks to a locally running `llama-server` via its
+# OpenAI-compatible endpoint). Only required for notes_mode="llama_cpp";
+# template mode works without it.
+openai>=1.0.0

@@ -5,15 +5,17 @@ import VideoDropzone from "@/components/VideoDropzone";
 import ProcessingState from "@/components/ProcessingState";
 import ResultsPanel from "@/components/ResultsPanel";
 import { uploadVideo, type ProcessResult } from "@/lib/api";
-import { ArrowRight, Sparkles, Video, FileText, Hand } from "lucide-react";
+import { ArrowRight, Sparkles, Video, FileText, Hand, ChevronDown } from "lucide-react";
 
 export default function Index() {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ProcessResult | null>(null);
   const [error, setError] = useState("");
-  const [notesMode, setNotesMode] = useState<"template" | "ollama">("template");
+  const [notesMode, setNotesMode] = useState<"template" | "llama_cpp">("template");
   const [style, setStyle] = useState<"concise" | "detailed" | "academic">("concise");
+  const [threshold, setThreshold] = useState(0.55);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   const handleUpload = async () => {
     if (!file) return;
@@ -21,7 +23,7 @@ export default function Index() {
     setError("");
     setResult(null);
     try {
-      const res = await uploadVideo(file, { notesMode, style });
+      const res = await uploadVideo(file, { notesMode, style, threshold });
       setResult(res);
     } catch (e: any) {
       setError(e.message || "Something went wrong");
@@ -101,13 +103,52 @@ export default function Index() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <select value={notesMode} onChange={(e) => setNotesMode(e.target.value as any)} className="rounded-lg border bg-background px-3 py-2 text-sm">
                     <option value="template">Deterministic notes</option>
-                    <option value="ollama">Llama 3.2 via Ollama</option>
+                    <option value="llama_cpp">Local LLM (llama.cpp)</option>
                   </select>
                   <select value={style} onChange={(e) => setStyle(e.target.value as any)} className="rounded-lg border bg-background px-3 py-2 text-sm">
                     <option value="concise">Concise</option>
                     <option value="detailed">Detailed</option>
                     <option value="academic">Academic</option>
                   </select>
+                </div>
+
+                {notesMode === "llama_cpp" && (
+                  <p className="text-xs text-muted-foreground">
+                    Requires a local llama.cpp server running on port 8081. If it isn't reachable, notes fall back to the deterministic mode automatically.
+                  </p>
+                )}
+
+                <div>
+                  <button
+                    type="button"
+                    onClick={() => setShowAdvanced((v) => !v)}
+                    className="flex items-center gap-1 text-xs font-medium text-muted-foreground hover:text-foreground"
+                  >
+                    <ChevronDown className={`h-3.5 w-3.5 transition-transform ${showAdvanced ? "rotate-180" : ""}`} />
+                    Advanced settings
+                  </button>
+                  {showAdvanced && (
+                    <div className="mt-2 space-y-2 rounded-lg border border-border p-3">
+                      <div className="flex items-center justify-between text-xs">
+                        <label htmlFor="threshold">
+                          Confidence threshold: <strong>{threshold.toFixed(2)}</strong>
+                        </label>
+                      </div>
+                      <input
+                        id="threshold"
+                        type="range"
+                        min={0.1}
+                        max={0.9}
+                        step={0.05}
+                        value={threshold}
+                        onChange={(e) => setThreshold(parseFloat(e.target.value))}
+                        className="w-full"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Lower this if you're getting "No confident signs detected" — a small demo-scale model often predicts correctly with confidence below the 0.55 default.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <p className="text-xs text-muted-foreground">

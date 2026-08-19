@@ -7,20 +7,35 @@ export interface ProcessResult {
   confidence: number;
   backend: string;
   providers?: string[];
+  low_confidence?: boolean;
 }
 
 export async function uploadVideo(file: File, options: {
-  notesMode?: "template" | "ollama";
-  ollamaModel?: string;
+  notesMode?: "template" | "llama_cpp";
+  llmModel?: string;
   style?: "concise" | "detailed" | "academic";
+  threshold?: number;
+  frameSkip?: number;
+  stride?: number;
 } = {}): Promise<ProcessResult> {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("notes_mode", options.notesMode || "template");
-  fd.append("ollama_model", options.ollamaModel || "llama3.2:3b");
+  fd.append("llm_model", options.llmModel || "gemma4");
   fd.append("style", options.style || "concise");
+  if (options.threshold !== undefined) fd.append("threshold", String(options.threshold));
+  if (options.frameSkip !== undefined) fd.append("frame_skip", String(options.frameSkip));
+  if (options.stride !== undefined) fd.append("stride", String(options.stride));
 
-  const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: fd });
+  let res: Response;
+  try {
+    res = await fetch(`${API_BASE}/upload`, { method: "POST", body: fd });
+  } catch (e) {
+    throw new Error(
+      "Couldn't reach the backend. Is it running at " + API_BASE + "?"
+    );
+  }
+
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.error || `Server error ${res.status}`);
   return body;

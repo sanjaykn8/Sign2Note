@@ -1,9 +1,9 @@
 from typing import List
 
-import requests
-
 
 def template_notes_from_tokens(tokens: List[str], title: str = "Generated Notes") -> str:
+    """Deterministic, LLM-free notes generator. Always available — no external
+    service required, so this is the safe fallback for every failure mode."""
     if not tokens:
         return "# Generated Notes\n\nNo confident signs were detected. Please repeat the gesture."
     lines = [f"# {title}", "", "## Detected Content", ""]
@@ -13,7 +13,8 @@ def template_notes_from_tokens(tokens: List[str], title: str = "Generated Notes"
     return "\n".join(lines)
 
 
-def _prompt(tokens: List[str], style: str) -> str:
+def build_notes_prompt(tokens: List[str], style: str = "concise") -> str:
+    """Shared prompt builder used by the llama.cpp-backed notes generator in infer.py."""
     style_text = {
         "concise": "Use concise headings and bullet points.",
         "detailed": "Use slightly expanded explanations, but do not invent unsupported facts.",
@@ -31,25 +32,3 @@ Rules:
 Gloss sequence:
 {', '.join(tokens)}
 """
-
-
-def generate_ollama_notes(tokens: List[str], model="llama3.2:3b", style="concise") -> str:
-    r = requests.post(
-        "http://127.0.0.1:11434/api/generate",
-        json={"model": model, "prompt": _prompt(tokens, style), "stream": False,
-              "options": {"temperature": 0.1}},
-        timeout=90,
-    )
-    r.raise_for_status()
-    text = r.json().get("response", "").strip()
-    if not text:
-        raise RuntimeError("Ollama returned an empty response")
-    return text
-
-
-def run_llama_cpp_prompt(gguf_path: str, prompt: str,
-                         llama_bin_path: str, n_predict: int = 512) -> str:
-    import subprocess
-    cmd = [llama_bin_path, "-m", gguf_path, "-p", prompt, "--n_predict", str(n_predict)]
-    out = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
-    return out.stdout.strip()
