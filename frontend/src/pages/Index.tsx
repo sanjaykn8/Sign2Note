@@ -12,6 +12,8 @@ export default function Index() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ProcessResult | null>(null);
   const [error, setError] = useState("");
+  const [notesMode, setNotesMode] = useState<"template" | "ollama">("template");
+  const [style, setStyle] = useState<"concise" | "detailed" | "academic">("concise");
 
   const handleUpload = async () => {
     if (!file) return;
@@ -19,7 +21,7 @@ export default function Index() {
     setError("");
     setResult(null);
     try {
-      const res = await uploadVideo(file);
+      const res = await uploadVideo(file, { notesMode, style });
       setResult(res);
     } catch (e: any) {
       setError(e.message || "Something went wrong");
@@ -95,6 +97,22 @@ export default function Index() {
                     {error}
                   </div>
                 )}
+
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <select value={notesMode} onChange={(e) => setNotesMode(e.target.value as any)} className="rounded-lg border bg-background px-3 py-2 text-sm">
+                    <option value="template">Deterministic notes</option>
+                    <option value="ollama">Llama 3.2 via Ollama</option>
+                  </select>
+                  <select value={style} onChange={(e) => setStyle(e.target.value as any)} className="rounded-lg border bg-background px-3 py-2 text-sm">
+                    <option value="concise">Concise</option>
+                    <option value="detailed">Detailed</option>
+                    <option value="academic">Academic</option>
+                  </select>
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  Privacy: the uploaded video is processed locally and deleted after keypoint extraction.
+                </p>
 
                 <Button
                   onClick={handleUpload}

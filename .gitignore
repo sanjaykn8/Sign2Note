@@ -11,6 +11,7 @@ venv/
 data/
 ml_service/data/
 models/
+uploads/
 *.npz
 *.npy
 

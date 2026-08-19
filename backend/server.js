@@ -1,45 +1,55 @@
-// backend/server.js
-const express   = require('express');
-const multer    = require('multer');
-const fetch     = require('node-fetch');
-const FormData  = require('form-data');
-const fs        = require('fs');
-const path      = require('path');
-const cors      = require('cors');
-
-const UPLOAD_DIR = path.join(__dirname, 'uploads');
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename:    (req, file, cb) => cb(null, Date.now() + '-' + file.originalname),
-});
-const upload = multer({ storage });
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const FormData = require('form-data');
+const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ML_SERVICE_URL = 'http://127.0.0.1:8000/process';
+// Memory storage: the gateway never writes uploaded video to disk.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 100 * 1024 * 1024 },
+});
 
-app.post('/upload', upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).json({ error: 'no file' });
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://127.0.0.1:8000/process';
 
-  const fd = new FormData();
-  fd.append('file',       fs.createReadStream(req.file.path), req.file.originalname);
-  fd.append('use_llama',  req.body.use_llama  === 'true' ? 'true' : 'false');
-  fd.append('use_ollama', req.body.use_ollama === 'true' ? 'true' : 'false');
-
+app.get('/health', async (_req, res) => {
   try {
-    const r    = await fetch(ML_SERVICE_URL, { method: 'POST', body: fd });
+    const r = await fetch(ML_SERVICE_URL.replace('/process', '/health'));
     const json = await r.json();
-    return res.json(json);
+    res.json({ gateway: 'ok', ml: json });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.toString() });
+    res.status(503).json({ gateway: 'ok', ml: 'unavailable', error: err.message });
   }
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.post('/upload', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No video file supplied.' });
 
-app.listen(3001, () => console.log('Backend listening on http://localhost:3001'));
+  const fd = new FormData();
+  fd.append('file', req.file.buffer, {
+    filename: req.file.originalname || 'upload.mp4',
+    contentType: req.file.mimetype || 'video/mp4',
+  });
+  fd.append('notes_mode', req.body.notes_mode || 'template');
+  fd.append('ollama_model', req.body.ollama_model || 'llama3.2:3b');
+  fd.append('style', req.body.style || 'concise');
+  fd.append('frame_skip', req.body.frame_skip || '8');
+  fd.append('stride', req.body.stride || '12');
+  fd.append('threshold', req.body.threshold || '0.55');
+
+  try {
+    const r = await fetch(ML_SERVICE_URL, { method: 'POST', body: fd, headers: fd.getHeaders() });
+    const json = await r.json();
+    res.status(r.status).json(json);
+  } catch (err) {
+    console.error(err);
+    res.status(502).json({ error: `ML service unavailable: ${err.message}` });
+  }
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => console.log(`Backend listening on http://localhost:${PORT}`));

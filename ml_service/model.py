@@ -1,73 +1,49 @@
 import torch
 import torch.nn as nn
 
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, dilation=1):
-        super().__init__()
-        # Bottleneck design: 1x1 (reduce) -> 3x3 (process) -> 1x1 (expand)
-        mid_channels = out_channels // 2
-        
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_channels, mid_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(mid_channels, mid_channels, kernel_size=3, 
-                      padding=dilation, dilation=dilation, bias=False),
-            nn.BatchNorm1d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(mid_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm1d(out_channels),
-        )
-        
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm1d(out_channels)
-            )
-            
-        self.relu = nn.ReLU(inplace=True)
-
-    def forward(self, x):
-        return self.relu(self.conv(x) + self.shortcut(x))
 
 class TemporalCNN(nn.Module):
-    def __init__(self, input_dim, num_classes):
+    """
+    Small temporal classifier — no LSTM, no learned attention pooling.
+    Global average pooling gives translation-invariant features and has
+    zero learnable parameters, which matters a lot when you only have a
+    handful of samples per class: it structurally can't memorize *where*
+    in the clip something happened, only *what pattern* occurred.
+
+    Input:  (B, T, D)
+    Output: (B, C)
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        num_classes: int,
+        hidden: int = 96,          # slightly smaller than 128; drop to 64 if still overfitting
+        conv_dropout: float = 0.15,  # NEW: dropout between conv blocks, not just before FC
+        head_dropout: float = 0.3,   # NEW: a bit stronger than before, since FC->classes is the
+                                      # single largest, most overfit-prone layer here
+    ):
         super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv1d(input_dim, hidden, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(conv_dropout),
 
-        # Initial Feature Extraction (The Stem)
-        self.stem = nn.Sequential(
-            nn.Conv1d(input_dim, 128, kernel_size=7, padding=3, bias=False),
-            nn.BatchNorm1d(128),
-            nn.ReLU(inplace=True)
+            nn.Conv1d(hidden, hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(conv_dropout),
+
+            nn.Conv1d(hidden, hidden * 2, kernel_size=3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm1d(hidden * 2),
+            nn.ReLU(inplace=True),
         )
-
-        # Deep Residual Backbone
-        self.layers = nn.Sequential(
-            # Stage 1: Local patterns
-            ResidualBlock(128, 128),
-            ResidualBlock(128, 128),
-            
-            # Stage 2: Mid-range patterns (increasing width)
-            ResidualBlock(128, 256),
-            ResidualBlock(256, 256, dilation=2), # Dilated to see longer sequences
-            
-            # Stage 3: High-level features
-            ResidualBlock(256, 512),
-            ResidualBlock(512, 512, dilation=4), # Wide temporal context
-        )
-
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(512, num_classes)
+        self.dropout = nn.Dropout(head_dropout)
+        self.fc = nn.Linear(hidden * 2, num_classes)
 
-    def forward(self, x):
-        # x shape: (Batch, Time, Dim)
-        x = x.transpose(1, 2) # (Batch, Dim, Time)
-        
-        x = self.stem(x)
-        x = self.layers(x)
-        
-        x = self.pool(x).flatten(1)
-        x = self.dropout(x)
-        return self.fc(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        x = self.features(x)
+        x = self.pool(x).squeeze(-1)
+        return self.fc(self.dropout(x))

@@ -1,53 +1,55 @@
-# ml_service/notes_generator.py
-import json
-import subprocess
-from pathlib import Path
-from typing import List, Optional
+from typing import List
 
-def template_notes_from_tokens(tokens: List[str], title: Optional[str]=None) -> str:
-    """
-    Simple deterministic notes generator for demo.
-    """
-    if title is None:
-        title = "Generated Notes"
-    md = []
-    md.append(f"# {title}\n")
-    md.append("**Summary:**\n")
-    md.append("This document summarizes the content detected from the sign language video. Below are expanded sections and key points.\n\n")
-    # group tokens into pseudo sections of 6 tokens
-    chunk_size = 6
-    for i in range(0, len(tokens), chunk_size):
-        chunk = tokens[i:i+chunk_size]
-        heading = chunk[0] if chunk else "Section"
-        md.append(f"## **{heading}**\n")
-        for t in chunk:
-            md.append(f"- *{t}* — Expanded explanation about **{t}**. Add more detail here based on context.\n")
-        md.append("\n")
-    md.append("**Conclusion:**\n")
-    md.append("The above notes are auto-generated. Use them as a baseline and edit for accuracy.\n")
-    return "".join(md)
+import requests
 
-def run_llama_cpp_prompt(gguf_path: str, prompt: str, llama_bin_path: str = "./llama.cpp/main", n_predict:int=512) -> str:
-    """
-    Optional: call llama.cpp `main` binary. Returns raw output text.
-    User must build llama.cpp with CUDA or CPU and provide path to binary.
-    """
+
+def template_notes_from_tokens(tokens: List[str], title: str = "Generated Notes") -> str:
+    if not tokens:
+        return "# Generated Notes\n\nNo confident signs were detected. Please repeat the gesture."
+    lines = [f"# {title}", "", "## Detected Content", ""]
+    for token in tokens:
+        lines.append(f"- **{token}**")
+    lines += ["", "## Review", "", "These notes were generated from recognized sign glosses. Verify low-confidence or ambiguous content before use."]
+    return "\n".join(lines)
+
+
+def _prompt(tokens: List[str], style: str) -> str:
+    style_text = {
+        "concise": "Use concise headings and bullet points.",
+        "detailed": "Use slightly expanded explanations, but do not invent unsupported facts.",
+        "academic": "Use a formal academic structure with clear headings and concise bullets.",
+    }.get(style, "Use concise headings and bullet points.")
+    return f"""You are Sign2Notes, a classroom note-taking assistant.
+Convert ONLY the following ASL gloss sequence into readable Markdown notes.
+{style_text}
+Rules:
+1. Preserve the meaning of the glosses.
+2. Do not invent lecture facts, examples, dates, formulas, or names that are not supported by the input.
+3. Group repeated/related glosses when sensible.
+4. Output Markdown only.
+
+Gloss sequence:
+{', '.join(tokens)}
+"""
+
+
+def generate_ollama_notes(tokens: List[str], model="llama3.2:3b", style="concise") -> str:
+    r = requests.post(
+        "http://127.0.0.1:11434/api/generate",
+        json={"model": model, "prompt": _prompt(tokens, style), "stream": False,
+              "options": {"temperature": 0.1}},
+        timeout=90,
+    )
+    r.raise_for_status()
+    text = r.json().get("response", "").strip()
+    if not text:
+        raise RuntimeError("Ollama returned an empty response")
+    return text
+
+
+def run_llama_cpp_prompt(gguf_path: str, prompt: str,
+                         llama_bin_path: str, n_predict: int = 512) -> str:
+    import subprocess
     cmd = [llama_bin_path, "-m", gguf_path, "-p", prompt, "--n_predict", str(n_predict)]
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
-        return out.stdout
-    except Exception as e:
-        return f"[llama.cpp call failed: {e}]"
-
-def tokens_to_markdown(tokens_list, use_llama=False, gguf_path=None, llama_bin_path=None):
-    """
-    tokens_list: list of token strings
-    If use_llama and gguf_path provided, will assemble a prompt and call llama.cpp; otherwise use template_notes_from_tokens.
-    """
-    if use_llama and gguf_path:
-        token_text = " ".join(tokens_list)
-        prompt = f"You are a note-taking assistant. Convert this token sequence into well-structured Markdown notes:\n\n{token_text}\n\nOutput only Markdown."
-        out = run_llama_cpp_prompt(gguf_path, prompt, llama_bin_path or "./llama.cpp/main", n_predict=512)
-        return out
-    else:
-        return template_notes_from_tokens(tokens_list)
+    out = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+    return out.stdout.strip()
