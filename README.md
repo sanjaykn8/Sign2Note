@@ -28,7 +28,11 @@ Markdown lecture notes
 The Node gateway keeps uploads in memory. FastAPI writes the raw video only to a temporary file, extracts keypoints, runs inference, and deletes both the video and extracted demo features in a `finally` block. WLASL training features are intentionally persisted because they are the model-training artifact; the original project workflow should keep raw videos out of the application runtime.
 
 ## Recommended MVP vocabulary
-Do **not** train all 1,880 WLASL classes for the demo. Start with 10–20 common classes. `build_index.py` can automatically select the most represented classes.
+The project now trains on **FDMSE-ISL** by default (see below). Do not attempt
+all 2,002 classes for a demo — `metadata_400.csv` (a curated 400-class subset,
+20 samples/class) is a much more realistic starting vocabulary; `metadata_atomic.csv`
+(single-gesture signs only, 1,099 classes) is another good option if you want
+broader coverage of simple signs and can tolerate a longer extraction run.
 
 ## Setup
 
@@ -49,7 +53,47 @@ cd ..\\frontend
 npm install
 ```
 
-## WLASL data layout
+## FDMSE-ISL data layout (default)
+
+```text
+data/
+  data_meta/
+    classes.txt              # full 2,002-class legend
+    classes_400.txt          # legend for the 400-class subset
+    metadata.csv             # all 2,002 classes, 40,034 clips, 20 signers
+    metadata_400.csv         # curated 400-class subset (20 samples/class) — default
+    metadata_atomic.csv      # single-gesture signs only (1,099 classes)
+    metadata_composite.csv   # multi-word/compound signs only (352 classes)
+  FDMSE-ISL/
+    data/
+      s0001/front/*.mp4
+      s0002/front/*.mp4
+      ...
+```
+
+Each metadata CSV has columns `id,video_dir,video_name,class,split` — `video_dir`
+is relative to `data/FDMSE-ISL` (e.g. `data/s0015/front/s0015_f_w000842.mp4`),
+`class` is the gloss label, and `split` is the dataset's own train/val/test
+assignment (not currently used by `train.py`, which does its own random split
+— see note below).
+
+## 1. Extract training keypoints
+
+```powershell
+python ml_service/feature_extraction.py `
+  --dataset_format fdmse `
+  --metadata_csv data/data_meta/metadata_400.csv `
+  --dataset_root data/FDMSE-ISL `
+  --out_dir data/features `
+  --frame_skip 8 `
+  --workers 4
+```
+
+Add `--max_videos 500` for a quick first pass, or `--splits train,val` to skip
+extracting the held-out test split until you're ready to evaluate.
+
+<details>
+<summary>Legacy WLASL layout (still supported)</summary>
 
 ```text
 data/
@@ -60,12 +104,9 @@ data/
       ...
 ```
 
-## 1. Extract training keypoints
-
-For a first demo, process a small subset:
-
 ```powershell
 python ml_service/feature_extraction.py `
+  --dataset_format wlasl `
   --videos_dir data/wlasl/videos `
   --out_dir data/features `
   --wlasl_json data/wlasl/WLASL_v0.3.json `
@@ -73,17 +114,23 @@ python ml_service/feature_extraction.py `
   --max_videos 500 `
   --workers 4
 ```
+</details>
 
 ## 2. Build a constrained vocabulary
 
 ```powershell
 python ml_service/build_index.py `
-  --max_classes 10 `
-  --min_samples 20
+  --dataset_format fdmse `
+  --metadata_csv data/data_meta/metadata_400.csv `
+  --min_samples 10
 ```
 
+`--max_classes 0` (the default) keeps every class that clears `--min_samples`
+— set it to a smaller number to further restrict the vocabulary. For the
+legacy WLASL layout, pass `--dataset_format wlasl --wlasl_json ...` instead.
+
 This creates:
-- `data/index.csv`
+- `data/index.csv` (now includes a `split` column when built from FDMSE-ISL)
 - `config/vocab.json`
 
 ## 3. Train
@@ -93,6 +140,11 @@ Windows-safe defaults use `num_workers=0` to avoid multiprocessing spawn errors.
 ```powershell
 python ml_service/train.py --epochs 20 --batch_size 32 --num_workers 0
 ```
+
+> **Note:** `train.py` currently does its own random train/val split
+> (`--val_split`, default 0.15) regardless of the `split` column FDMSE-ISL
+> provides. This is fine for a quick MVP run, but for a rigorous evaluation
+> matching the dataset's official split, that's a follow-up worth wiring in.
 
 Outputs:
 
