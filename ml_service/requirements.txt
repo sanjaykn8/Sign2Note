@@ -16,7 +16,12 @@ onnxruntime          # CPU runtime
 fastapi
 uvicorn[standard]
 python-multipart
-# LLM notes backend (talks to a locally running `llama-server` via its
-# OpenAI-compatible endpoint). Only required for notes_mode="llama_cpp";
-# template mode works without it.
+# LLM notes backend (talks to a locally running Ollama or llama.cpp server
+# via its OpenAI-compatible endpoint; see LLM_PROVIDER/LLM_MODEL/LLM_BASE_URL
+# in .env.example). Only required for notes_mode="llm"; template mode
+# works without it.
 openai>=1.0.0
+# Optional: loads .env for LLM_PROVIDER/LLM_MODEL/LLM_BASE_URL/
+# CONFIDENCE_THRESHOLD without having to export env vars manually.
+# Both api.py and infer.py degrade gracefully if this isn't installed.
+python-dotenv

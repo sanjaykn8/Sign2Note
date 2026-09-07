@@ -4,7 +4,8 @@ import { Card, CardContent } from "@/components/ui/card";
 import VideoDropzone from "@/components/VideoDropzone";
 import ProcessingState from "@/components/ProcessingState";
 import ResultsPanel from "@/components/ResultsPanel";
-import { uploadVideo, type ProcessResult } from "@/lib/api";
+import PrivacyBanner from "@/components/PrivacyBanner";
+import { uploadVideo, type ProcessResult, type NotesMode } from "@/lib/api";
 import { ArrowRight, Sparkles, Video, FileText, Hand, ChevronDown } from "lucide-react";
 
 export default function Index() {
@@ -12,7 +13,7 @@ export default function Index() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ProcessResult | null>(null);
   const [error, setError] = useState("");
-  const [notesMode, setNotesMode] = useState<"template" | "llama_cpp">("template");
+  const [notesMode, setNotesMode] = useState<NotesMode>("template");
   const [style, setStyle] = useState<"concise" | "detailed" | "academic">("concise");
   const [threshold, setThreshold] = useState(0.55);
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -103,7 +104,7 @@ export default function Index() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <select value={notesMode} onChange={(e) => setNotesMode(e.target.value as any)} className="rounded-lg border bg-background px-3 py-2 text-sm">
                     <option value="template">Deterministic notes</option>
-                    <option value="llama_cpp">Local LLM (llama.cpp)</option>
+                    <option value="llm">Local LLM (Ollama / llama.cpp)</option>
                   </select>
                   <select value={style} onChange={(e) => setStyle(e.target.value as any)} className="rounded-lg border bg-background px-3 py-2 text-sm">
                     <option value="concise">Concise</option>
@@ -112,9 +113,9 @@ export default function Index() {
                   </select>
                 </div>
 
-                {notesMode === "llama_cpp" && (
+                {notesMode === "llm" && (
                   <p className="text-xs text-muted-foreground">
-                    Requires a local llama.cpp server running on port 8081. If it isn't reachable, notes fall back to the deterministic mode automatically.
+                    Requires a local Ollama or llama.cpp server (see .env for LLM_PROVIDER/LLM_MODEL/LLM_BASE_URL). If it isn't reachable, notes fall back to the deterministic mode automatically.
                   </p>
                 )}
 
@@ -151,9 +152,7 @@ export default function Index() {
                   )}
                 </div>
 
-                <p className="text-xs text-muted-foreground">
-                  Privacy: the uploaded video is processed locally and deleted after keypoint extraction.
-                </p>
+                <PrivacyBanner variant="upload" />
 
                 <Button
                   onClick={handleUpload}
