@@ -17,8 +17,8 @@ class TemporalCNN(nn.Module):
         self,
         input_dim: int,
         num_classes: int,
-        hidden: int = 96,          # slightly smaller than 128; drop to 64 if still overfitting
-        conv_dropout: float = 0.15,  # NEW: dropout between conv blocks, not just before FC
+        hidden: int = 192,          # slightly smaller than 128; drop to 64 if still overfitting
+        conv_dropout: float = 0.25,  # NEW: dropout between conv blocks, not just before FC
         head_dropout: float = 0.3,   # NEW: a bit stronger than before, since FC->classes is the
                                       # single largest, most overfit-prone layer here
     ):
@@ -37,6 +37,7 @@ class TemporalCNN(nn.Module):
             nn.Conv1d(hidden, hidden * 2, kernel_size=3, padding=2, dilation=2, bias=False),
             nn.BatchNorm1d(hidden * 2),
             nn.ReLU(inplace=True),
+            nn.Dropout(conv_dropout),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.dropout = nn.Dropout(head_dropout)

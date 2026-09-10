@@ -1,28 +1,8 @@
 import type { ProcessResult } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { FileText, Hand, AlertTriangle } from "lucide-react";
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function renderMarkdown(md: string): string {
-  return escapeHtml(md)
-    .replace(/^### (.+)$/gm, "<h3 class='text-base font-semibold mt-4 mb-1'>$1</h3>")
-    .replace(/^## (.+)$/gm, "<h2 class='text-lg font-bold mt-5 mb-2'>$1</h2>")
-    .replace(/^# (.+)$/gm, "<h1 class='text-xl font-bold mt-6 mb-2'>$1</h1>")
-    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*(.+?)\*/g, "<em>$1</em>")
-    .replace(/^- (.+)$/gm, "<li class='ml-4 list-disc'>$1</li>")
-    .replace(/\n{2,}/g, "<br/><br/>")
-    .replace(/\n/g, "<br/>");
-}
+import NotesPanel from "@/components/NotesPanel";
+import { Hand, AlertTriangle } from "lucide-react";
 
 export default function ResultsPanel({ result }: { result: ProcessResult }) {
   return (
@@ -52,23 +32,8 @@ export default function ResultsPanel({ result }: { result: ProcessResult }) {
         </Card>
       )}
 
-      {/* Notes */}
-      {result.notes_md && (
-        <Card>
-          <CardHeader className="pb-3">
-            <CardTitle className="flex items-center gap-2 text-base">
-              <FileText className="h-5 w-5 text-primary" />
-              Generated Notes
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <div
-              className="prose prose-sm max-w-none text-foreground leading-relaxed"
-              dangerouslySetInnerHTML={{ __html: renderMarkdown(result.notes_md) }}
-            />
-          </CardContent>
-        </Card>
-      )}
+      {/* Notes -- preview, edit, and export as Markdown/Text/PDF */}
+      {result.notes_md && <NotesPanel markdown={result.notes_md} title="Lecture Notes" />}
     </div>
   );
 }

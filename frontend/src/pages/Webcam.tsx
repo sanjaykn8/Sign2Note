@@ -4,14 +4,16 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import PrivacyBanner from "@/components/PrivacyBanner";
+import NotesPanel from "@/components/NotesPanel";
 import { getModelMeta, getModelOnnxBytes, generateNotesFromGlosses, type ModelMeta, type NotesMode } from "@/lib/api";
 import { loadHandLandmarker, detectHands } from "@/lib/handLandmarker";
 import { loadOnnxSession, runInference } from "@/lib/onnxSession";
 import { KeypointBuffer, SessionSmoother, keypointsFromLandmarks, softmaxArgmax, DEFAULT_SMOOTHING, type PredictionEvent } from "@/lib/webcamPipeline";
-import { Camera, Square, Trash2, FileText, AlertTriangle, Hand } from "lucide-react";
+import { Camera, Square, Trash2, FileText, AlertTriangle, Hand, Pencil, Check, X, Undo2, Play, Pause as PauseIcon } from "lucide-react";
 
 type CameraState = "idle" | "requesting" | "active" | "error";
 type ModelState = "idle" | "loading" | "ready" | "error";
+type CurrentSign = { label: string; confidence: number } | "uncertain" | "no_sign" | null;
 
 // How often to run hand-landmark detection + inference, in ms. Chosen to
 // roughly match the training-time sampling cadence: frame_skip=8 at a
@@ -30,6 +32,9 @@ export default function Webcam() {
   const bufferRef = useRef<KeypointBuffer | null>(null);
   const smootherRef = useRef<SessionSmoother>(new SessionSmoother(DEFAULT_SMOOTHING));
   const sessionStartRef = useRef<number>(0);
+  const pausedRef = useRef(false);
+  const pauseStartRef = useRef<number | null>(null);
+  const totalPausedMsRef = useRef(0);
   const onnxSessionRef = useRef<Awaited<ReturnType<typeof loadOnnxSession>> | null>(null);
   const landmarkerRef = useRef<Awaited<ReturnType<typeof loadHandLandmarker>> | null>(null);
   const modelMetaRef = useRef<ModelMeta | null>(null);
@@ -39,9 +44,13 @@ export default function Webcam() {
   const [modelState, setModelState] = useState<ModelState>("idle");
   const [modelError, setModelError] = useState<string | null>(null);
   const [sessionActive, setSessionActive] = useState(false);
-  const [current, setCurrent] = useState<{ label: string; confidence: number } | "uncertain" | null>(null);
+  const [paused, setPaused] = useState(false);
+  const [current, setCurrent] = useState<CurrentSign>(null);
   const [history, setHistory] = useState<PredictionEvent[]>([]);
+  const [editingIndex, setEditingIndex] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const [notes, setNotes] = useState<string | null>(null);
+  const [notesDuration, setNotesDuration] = useState<number | undefined>(undefined);
   const [notesMode, setNotesMode] = useState<NotesMode>("template");
   const [generating, setGenerating] = useState(false);
   const [notesError, setNotesError] = useState<string | null>(null);
@@ -106,8 +115,12 @@ export default function Webcam() {
     }
   };
 
+  const elapsedSessionSeconds = () =>
+    (performance.now() - sessionStartRef.current - totalPausedMsRef.current) / 1000;
+
   const detectLoop = useCallback((timestampMs: number) => {
     rafRef.current = requestAnimationFrame(detectLoop);
+    if (pausedRef.current) return;
     if (timestampMs - lastDetectionRef.current < DETECTION_INTERVAL_MS) return;
     if (detectingRef.current) return;
     lastDetectionRef.current = timestampMs;
@@ -135,10 +148,11 @@ export default function Webcam() {
         const { index, confidence } = softmaxArgmax(logits);
         const label = meta.id2label[String(index)] ?? `class_${index}`;
 
-        const elapsedSeconds = (performance.now() - sessionStartRef.current) / 1000;
-        const result = smootherRef.current.update(label, confidence, elapsedSeconds);
+        const result = smootherRef.current.update(label, confidence, elapsedSessionSeconds());
 
-        if (result.status === "uncertain") {
+        if (result.status === "no_sign") {
+          setCurrent("no_sign");
+        } else if (result.status === "uncertain") {
           setCurrent("uncertain");
         } else {
           setCurrent({ label, confidence });
@@ -176,10 +190,16 @@ export default function Webcam() {
       bufferRef.current?.clear();
       smootherRef.current.reset();
       sessionStartRef.current = performance.now();
+      totalPausedMsRef.current = 0;
+      pauseStartRef.current = null;
+      pausedRef.current = false;
       lastDetectionRef.current = 0;
+      setPaused(false);
       setHistory([]);
+      setEditingIndex(null);
       setCurrent(null);
       setNotes(null);
+      setNotesDuration(undefined);
       setNotesError(null);
       setSessionActive(true);
       rafRef.current = requestAnimationFrame(detectLoop);
@@ -200,17 +220,78 @@ export default function Webcam() {
   const stopSession = () => {
     stopCamera();
     setSessionActive(false);
+    setPaused(false);
+    pausedRef.current = false;
+    pauseStartRef.current = null;
     setCameraState("idle");
     setCurrent(null);
   };
 
+  const pauseSession = () => {
+    if (!sessionActive || pausedRef.current) return;
+    pausedRef.current = true;
+    pauseStartRef.current = performance.now();
+    setPaused(true);
+    setCurrent(null);
+  };
+
+  const resumeSession = () => {
+    if (!sessionActive || !pausedRef.current) return;
+    if (pauseStartRef.current !== null) {
+      totalPausedMsRef.current += performance.now() - pauseStartRef.current;
+      pauseStartRef.current = null;
+    }
+    pausedRef.current = false;
+    setPaused(false);
+  };
+
   const clearSession = () => {
     setHistory([]);
+    setEditingIndex(null);
     setCurrent(null);
     setNotes(null);
+    setNotesDuration(undefined);
     setNotesError(null);
     smootherRef.current.reset();
   };
+
+  const undoLast = () => {
+    setHistory((h) => {
+      if (h.length === 0) return h;
+      const next = h.slice(0, -1);
+      smootherRef.current.forgetLastCommitted(next.length > 0 ? next[next.length - 1].label : null);
+      return next;
+    });
+    setEditingIndex(null);
+  };
+
+  const deleteEvent = (index: number) => {
+    setHistory((h) => {
+      const next = h.filter((_, i) => i !== index);
+      // If we just removed the most recent event, let the smoother forget
+      // it so a genuine repeat of that sign can be committed again later.
+      if (index === h.length - 1) {
+        smootherRef.current.forgetLastCommitted(next.length > 0 ? next[next.length - 1].label : null);
+      }
+      return next;
+    });
+    setEditingIndex(null);
+  };
+
+  const startEdit = (index: number) => {
+    setEditingIndex(index);
+    setEditDraft(history[index].label);
+  };
+
+  const saveEdit = (index: number) => {
+    const cleaned = editDraft.trim().toUpperCase();
+    if (cleaned) {
+      setHistory((h) => h.map((e, i) => (i === index ? { ...e, label: cleaned } : e)));
+    }
+    setEditingIndex(null);
+  };
+
+  const cancelEdit = () => setEditingIndex(null);
 
   const handleGenerateNotes = async () => {
     if (history.length === 0) return;
@@ -219,6 +300,7 @@ export default function Webcam() {
     try {
       const res = await generateNotesFromGlosses(history.map((e) => e.label), { notesMode });
       setNotes(res.notes_md);
+      setNotesDuration(sessionActive ? elapsedSessionSeconds() : history[history.length - 1]?.timestamp);
     } catch (err: any) {
       setNotesError(err?.message || "Failed to generate notes.");
     } finally {
@@ -257,6 +339,12 @@ export default function Webcam() {
                   {cameraState === "requesting" ? "Requesting camera access…" : "Camera is off"}
                 </div>
               )}
+              {paused && cameraState === "active" && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-sm font-medium text-white">
+                  <PauseIcon className="h-4 w-4 mr-2" />
+                  Paused — recognition is not running
+                </div>
+              )}
             </div>
 
             {cameraError && (
@@ -273,11 +361,28 @@ export default function Webcam() {
                   Start Session
                 </Button>
               ) : (
-                <Button onClick={stopSession} variant="secondary">
-                  <Square className="h-4 w-4 mr-2" />
-                  Stop Session
-                </Button>
+                <>
+                  <Button onClick={stopSession} variant="secondary">
+                    <Square className="h-4 w-4 mr-2" />
+                    Stop Session
+                  </Button>
+                  {paused ? (
+                    <Button onClick={resumeSession} variant="secondary">
+                      <Play className="h-4 w-4 mr-2" />
+                      Resume
+                    </Button>
+                  ) : (
+                    <Button onClick={pauseSession} variant="secondary">
+                      <PauseIcon className="h-4 w-4 mr-2" />
+                      Pause
+                    </Button>
+                  )}
+                </>
               )}
+              <Button onClick={undoLast} variant="outline" disabled={history.length === 0}>
+                <Undo2 className="h-4 w-4 mr-2" />
+                Undo
+              </Button>
               <Button onClick={clearSession} variant="outline" disabled={history.length === 0 && !notes}>
                 <Trash2 className="h-4 w-4 mr-2" />
                 Clear Session
@@ -304,14 +409,24 @@ export default function Webcam() {
               <CardTitle className="text-base">Current Sign</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2">
-              {current === null && <p className="text-sm text-muted-foreground">Start a session to begin recognizing signs.</p>}
+              {current === null && (
+                <p className="text-sm text-muted-foreground">
+                  {paused ? "Recognition paused." : "Start a session to begin recognizing signs."}
+                </p>
+              )}
+              {current === "no_sign" && (
+                <div className="flex items-center gap-2 text-muted-foreground text-sm">
+                  <Hand className="h-4 w-4 opacity-40" />
+                  No sign detected
+                </div>
+              )}
               {current === "uncertain" && (
                 <div className="flex items-center gap-2 text-amber-600 text-sm">
                   <AlertTriangle className="h-4 w-4" />
-                  Low confidence — please repeat
+                  Uncertain — hold the sign steady
                 </div>
               )}
-              {current && current !== "uncertain" && (
+              {current && current !== "uncertain" && current !== "no_sign" && (
                 <>
                   <div className="text-xl font-bold flex items-center gap-2">
                     <Hand className="h-5 w-5 text-accent" />
@@ -334,10 +449,51 @@ export default function Webcam() {
               ) : (
                 <ul className="space-y-1 max-h-64 overflow-y-auto text-sm">
                   {history.map((e, i) => (
-                    <li key={i} className="flex items-center justify-between gap-2">
-                      <span className="tabular-nums text-muted-foreground">{formatTime(e.timestamp)}</span>
-                      <Badge variant="secondary">{e.label}</Badge>
-                      <span className="text-xs text-muted-foreground">{(e.confidence * 100).toFixed(0)}%</span>
+                    <li key={i} className="group flex items-center gap-2">
+                      <span className="tabular-nums text-muted-foreground shrink-0 w-12">{formatTime(e.timestamp)}</span>
+                      {editingIndex === i ? (
+                        <div className="flex flex-1 items-center gap-1">
+                          <input
+                            autoFocus
+                            value={editDraft}
+                            onChange={(ev) => setEditDraft(ev.target.value)}
+                            onKeyDown={(ev) => {
+                              if (ev.key === "Enter") saveEdit(i);
+                              if (ev.key === "Escape") cancelEdit();
+                            }}
+                            className="flex-1 rounded border bg-background px-2 py-0.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                          />
+                          <button onClick={() => saveEdit(i)} className="text-emerald-600 hover:text-emerald-700" aria-label="Save">
+                            <Check className="h-3.5 w-3.5" />
+                          </button>
+                          <button onClick={cancelEdit} className="text-muted-foreground hover:text-foreground" aria-label="Cancel">
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <Badge variant="secondary" className="flex-1 justify-center truncate">
+                            {e.label}
+                          </Badge>
+                          <span className="text-xs text-muted-foreground shrink-0 w-9 text-right">
+                            {(e.confidence * 100).toFixed(0)}%
+                          </span>
+                          <button
+                            onClick={() => startEdit(i)}
+                            className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-foreground group-hover:opacity-100"
+                            aria-label="Edit"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={() => deleteEvent(i)}
+                            className="shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-destructive group-hover:opacity-100"
+                            aria-label="Delete"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </>
+                      )}
                     </li>
                   ))}
                 </ul>
@@ -355,17 +511,13 @@ export default function Webcam() {
       )}
 
       {notes && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base flex items-center gap-2">
-              <FileText className="h-5 w-5 text-primary" />
-              Generated Lecture Notes
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <pre className="whitespace-pre-wrap text-sm font-sans">{notes}</pre>
-          </CardContent>
-        </Card>
+        <NotesPanel
+          markdown={notes}
+          title="Live Session Notes"
+          durationSeconds={notesDuration}
+          onRegenerate={handleGenerateNotes}
+          regenerating={generating}
+        />
       )}
     </div>
   );

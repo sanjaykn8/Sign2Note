@@ -181,19 +181,28 @@ point of a live display). Instead, `SessionSmoother`
 (`frontend/src/lib/webcamPipeline.ts`) uses a simpler, real-time-friendly
 rule:
 
-- A prediction below `acceptThreshold` (default **0.70**, per spec) is
-  surfaced as "Low confidence — please repeat" and never touches the
-  session history.
-- A label must repeat for `stableCount` (default 3) consecutive accepted
+- Confidence is read into three zones (per spec): below `ignoreThreshold`
+  (default **0.50**) is **NO_SIGN** — surfaced as "No sign detected",
+  never touches session history, and resets the stability streak (this
+  handles idle hands, transitions between signs, and general noise
+  without needing a trained NO_SIGN class yet). Between `ignoreThreshold`
+  and `acceptThreshold` (default **0.75**) is **uncertain** — surfaced as
+  "Uncertain — hold steady"; it's a soft tick that neither advances nor
+  resets an in-progress streak, so one shaky frame in the middle of a held
+  sign doesn't force the user to start over. At or above `acceptThreshold`
+  is **confident**, and can accumulate stability toward a commit.
+- A label must repeat for `stableCount` (default 3) consecutive confident
   predictions before it's committed as one event — this is what collapses
   "QUESTION QUESTION QUESTION QUESTION" (one held sign, sampled
   repeatedly) into a single `QUESTION` entry, and rejects one-frame noise.
 - Once a label is committed, repeating it again doesn't re-commit — only
-  a **different** label (once it's also stable) starts a new event.
+  a **different** label (once it's also stable) starts a new event. If the
+  user undoes or deletes that event from the UI, `forgetLastCommitted()`
+  lets the same label commit again later.
 
 This is a deliberate simplification, not a claim of true HMM decoding
 in-browser (see the development principle "do not over-engineer" in the
-project brief). It's covered by 19 unit tests in
+project brief). It's covered by unit tests in
 `frontend/src/lib/__tests__/webcamPipeline.test.ts`.
 
 ### Why /process (video upload) and the webcam session have different confidence policies
@@ -207,12 +216,14 @@ explicitly: they're deliberately different, for different UX goals.
   `api.py`) rather than showing a dead-end "couldn't process" screen. This
   was an explicit product decision for the upload flow — see the git
   history / prior session notes.
-- **Live webcam session**: the opposite. A low-confidence prediction is
-  surfaced as "please repeat" and is deliberately **not** added to the
-  session history, because the user is present and can just re-sign it —
-  there's no reason to guess when the real thing is one gesture away.
-  This matches the spec's confidence-handling requirement and Acceptance
-  Test 4.
+- **Live webcam session**: the opposite. A NO_SIGN or uncertain prediction
+  is surfaced inline ("No sign detected" / "Uncertain — hold steady") and
+  is deliberately **not** added to the session history, because the user
+  is present and can just re-sign it — there's no reason to guess when the
+  real thing is one gesture away. This matches the spec's confidence-
+  handling requirement and Acceptance Test 4. The user can also edit,
+  delete, or undo any committed event afterward, so a misread sign isn't
+  permanent even after it's been added.
 
 ## Model requirements
 
@@ -228,5 +239,7 @@ webcam demo, to run in a browser via WASM without a GPU at all. See
 |---|---|---|---|
 | `CONFIDENCE_THRESHOLD` (env) | `ml_service/.env` | 0.55 | Default `/process` threshold (per-request overridable) |
 | `threshold` (form field) | Upload request | 0.55 | Per-upload override |
-| `SessionSmoother.acceptThreshold` | `webcamPipeline.ts` | 0.70 | Webcam: below this → "please repeat", never appended |
-| `SessionSmoother.stableCount` | `webcamPipeline.ts` | 3 | Webcam: consecutive agreeing predictions needed to commit one event |
+| `SessionSmoother.ignoreThreshold` | `webcamPipeline.ts` | 0.50 | Webcam: below this → NO_SIGN ("no sign detected"), resets stability, never appended |
+| `SessionSmoother.acceptThreshold` | `webcamPipeline.ts` | 0.75 | Webcam: 0.50-0.74 is "uncertain" (soft tick, doesn't reset streak); at/above this a prediction can accumulate toward a commit |
+| `SessionSmoother.stableCount` | `webcamPipeline.ts` | 3 | Webcam: consecutive agreeing confident predictions needed to commit one event |
+| `SessionSmoother.forgetLastCommitted()` | `webcamPipeline.ts` | — | Called by the UI on undo/delete so an un-done sign can be re-committed later |

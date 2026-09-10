@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@hookform/resolvers": "^3.10.0",
+    "@mediapipe/tasks-vision": "^1.0.1",
     "@radix-ui/react-accordion": "^1.2.11",
     "@radix-ui/react-alert-dialog": "^1.1.14",
     "@radix-ui/react-aspect-ratio": "^1.1.7",
@@ -46,16 +47,16 @@
     "date-fns": "^3.6.0",
     "embla-carousel-react": "^8.6.0",
     "input-otp": "^1.4.2",
+    "jspdf": "^4.2.1",
     "lucide-react": "^0.462.0",
     "next-themes": "^0.3.0",
+    "onnxruntime-web": "^1.29.0",
     "react": "^18.3.1",
     "react-day-picker": "^8.10.1",
     "react-dom": "^18.3.1",
     "react-hook-form": "^7.61.1",
     "react-resizable-panels": "^2.1.9",
-    "react-router-dom": "^6.30.1",
-    "onnxruntime-web": "^1.29.0",
-    "@mediapipe/tasks-vision": "^1.0.1",
+    "react-router-dom": "^7.18.3",
     "recharts": "^2.15.4",
     "sonner": "^1.7.4",
     "tailwind-merge": "^2.6.0",
@@ -85,6 +86,13 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",
     "vite": "^8.2.1",
-    "vitest": "^3.2.4"
+    "vitest": "^5.0.0"
+  },
+  "allowScripts": {
+    "@swc/core@1.16.1": true,
+    "core-js@3.50.0": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.25.12": true,
+    "protobufjs@7.6.6": true
   }
 }

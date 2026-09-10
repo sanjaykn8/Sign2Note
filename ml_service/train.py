@@ -21,7 +21,7 @@ def parse_args():
     p.add_argument("--feature_dir", default="data/features")
     p.add_argument("--out_dir", default="models/sign_recog/checkpoints")
     p.add_argument("--epochs", type=int, default=20)
-    p.add_argument("--batch_size", type=int, default=32)
+    p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--max_len", type=int, default=64)
@@ -29,13 +29,13 @@ def parse_args():
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     # --- regularization / schedule knobs ---
-    p.add_argument("--label_smoothing", type=float, default=0.05,
+    p.add_argument("--label_smoothing", type=float, default=0.1,
                     help="CrossEntropyLoss label smoothing (0 disables it).")
     p.add_argument("--warmup_epochs", type=int, default=0,
                     help="Linear LR warmup epochs before cosine decay.")
     p.add_argument("--min_lr", type=float, default=1e-5,
                     help="Floor LR for the cosine schedule.")
-    p.add_argument("--patience", type=int, default=15,
+    p.add_argument("--patience", type=int, default=10,
                     help="Early-stopping patience, in epochs with no val_acc improvement.")
     p.add_argument("--min_delta", type=float, default=1e-4,
                     help="Minimum val_acc improvement to reset patience.")

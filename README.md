@@ -198,11 +198,14 @@ building this.
 ## Live webcam demo
 
 Click "Live Webcam" in the nav, then **Start Session** and sign -- a
-"Current Sign" display and a running "Sign History" update live. Click
-**Generate Notes** when done (or **Stop Session** first if you want to
-review the history before generating). **Clear Session** resets
-everything. See `ARCHITECTURE.md` for the full client-side pipeline and
-`PRIVACY.md` for exactly what does/doesn't leave the browser.
+"Current Sign" display and a running "Sign History" update live. Use
+**Pause**/**Resume** to freeze recognition without losing the session, and
+per-event pencil/trash icons or the **Undo** button to fix or remove a
+misrecognized sign. Click **Generate Notes** when done (or **Stop
+Session** first if you want to review the history before generating).
+**Clear Session** resets everything. See `ARCHITECTURE.md` for the full
+client-side pipeline and `PRIVACY.md` for exactly what does/doesn't leave
+the browser.
 
 ## LLM notes
 
@@ -216,6 +219,11 @@ Two modes, always available in the UI:
   `LLM_BASE_URL` -- see `.env.example`). Falls back to the deterministic
   template automatically if the server is unreachable -- you always get
   notes back.
+
+Generated notes always go through **Preview -> Edit -> Export**, never a
+direct download: click **Edit** to fix a misrecognized gloss before it
+leaves the app, then export as **Markdown**, **Text**, or **PDF** (all
+generated client-side, no extra backend round-trip).
 
 ## What Was Changed
 
@@ -274,6 +282,34 @@ already solid and were left alone):
   (`frontend/src/lib/__tests__/`, vitest, 19 new tests) suites described
   in `DEVELOPER_GUIDE.md`.
 - Wrote this documentation suite (previously only a single README existed).
+
+**Post-MVP: live transcript editing + real export** (this session, building
+on the above -- see the post-MVP workplan's P0 items 1-8)
+- `frontend/src/lib/webcamPipeline.ts` -- `SessionSmoother` now reads
+  confidence into three zones instead of one accept/reject threshold:
+  `ignoreThreshold` (0.50, "no sign detected") / `acceptThreshold` (0.75,
+  confident) / the uncertain band between them, which is a soft tick that
+  doesn't reset an in-progress streak. Added `forgetLastCommitted()` so
+  undoing/deleting a history event lets that label commit again later.
+  Test suite grew to 23 tests covering the new zones and undo behavior.
+- `frontend/src/pages/Webcam.tsx` -- Pause/Resume (freezes recognition,
+  keeps elapsed-time accounting correct via a paused-duration offset),
+  per-event inline edit and delete on Sign History rows, and an Undo
+  button for the most recent event. "No sign detected" is now shown
+  distinctly from "Uncertain -- hold steady".
+- New `frontend/src/components/NotesPanel.tsx` -- the **Preview -> Edit ->
+  Export** flow (workplan section 7/8): edit generated notes inline before
+  committing to a download, plus Regenerate. Shared by both the upload
+  flow (`ResultsPanel.tsx`) and the live webcam page.
+- New `frontend/src/lib/notesExport.ts` -- client-side Markdown/Text/PDF
+  export (PDF via a dynamically-imported `jspdf`, so it doesn't add to the
+  initial bundle for users who never export to PDF). The plain-text/PDF
+  layout matches the workplan's suggested document format (SIGN2NOTES
+  header, date/duration, uppercase section headers, footer disclaimer).
+- New `frontend/src/lib/markdown.ts` -- the Markdown-subset-to-HTML
+  renderer, extracted out of `ResultsPanel.tsx` so `NotesPanel` can share
+  it instead of duplicating it.
+- Added `jspdf` to `frontend/package.json`.
 
 ## Known Limitations
 

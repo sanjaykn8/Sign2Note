@@ -11,10 +11,11 @@ reduce how often this happens: lower `threshold` on the request, or
 retrain with more samples per class / a cleaner camera setup matching your
 training data's conditions.
 
-## Live webcam keeps showing "Low confidence — please repeat"
+## Live webcam keeps showing "No sign detected" or "Uncertain — hold steady"
 
-This is the intended behavior at low confidence (Acceptance Test 4) — the
-prediction simply isn't added to the session. If it happens constantly:
+This is the intended behavior at low/mid confidence (Acceptance Test 4) —
+the prediction simply isn't added to the session. If it happens
+constantly:
 
 - Check lighting and that both hands are in frame.
 - Confirm `/model/meta` and `/model/onnx` are reachable (open
@@ -24,9 +25,13 @@ prediction simply isn't added to the session. If it happens constantly:
   in `Webcam.tsx`) approximates the training-time `frame_skip` cadence; if
   your model was trained with a very different `frame_skip`, consider
   adjusting this constant to match more closely.
-- Lower `SessionSmoother`'s `acceptThreshold` in `webcamPipeline.ts` if
-  your model's confidence calibration runs lower than 0.70 in general
-  (this is a code constant, not currently exposed as a UI control).
+- Lower `SessionSmoother`'s `ignoreThreshold`/`acceptThreshold` in
+  `webcamPipeline.ts` if your model's confidence calibration runs lower
+  than the 0.50/0.75 defaults in general (these are code constants, not
+  currently exposed as a UI control).
+- If a sign was misread, you don't have to restart the whole session —
+  click the pencil icon on that row in Sign History to fix the label, the
+  trash icon to remove it, or **Undo** to drop the most recent event.
 
 ## Camera permission denied / camera not found
 
