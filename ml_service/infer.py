@@ -249,10 +249,6 @@ def predict_from_features(feature_path, checkpoint_path=None, onnx_path=None,
 
 
 def generate_llm_notes(gloss_list, model=None, style="concise", base_url=None):
-    """Call the configured local LLM server (Ollama or llama.cpp -- both
-    speak the OpenAI-compatible chat-completions API) to turn a gloss
-    sequence into notes. Requires the server to be running and the `openai`
-    package installed (pip install openai)."""
     if not gloss_list:
         raise ValueError("gloss_list is empty")
 
@@ -264,20 +260,19 @@ def generate_llm_notes(gloss_list, model=None, style="concise", base_url=None):
         client = _get_llm_client()
 
     prompt = build_notes_prompt(gloss_list, style=style)
+    
+    # Combine system instruction into the user prompt to avoid template parsing bugs in llama.cpp
+    full_content = (
+        "You are an AI assistant that converts sign-language gloss sequences into clear written notes.\n\n"
+        f"{prompt}"
+    )
+
     response = client.chat.completions.create(
         model=model or LLM_MODEL,
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You convert sign-language gloss sequences "
-                    "into clear written notes."
-                ),
-            },
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": full_content},
         ],
         temperature=0.2,
-        max_tokens=400,
     )
     text = (response.choices[0].message.content or "").strip()
     if not text:
