@@ -1,7 +1,6 @@
 """Keypoint window normalization and padding -- infer.py's _normalize(),
 _pad_window(), and _window_batch()."""
 import numpy as np
-import pytest
 
 from infer import _normalize, _pad_window, _window_batch
 

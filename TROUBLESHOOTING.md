@@ -35,7 +35,8 @@ constantly:
 
 ## Camera permission denied / camera not found
 
-The Webcam page surfaces these as readable messages, not stack traces:
+The Webcam and Live Transcription pages surface these as readable
+messages, not stack traces:
 - **Permission denied**: check your browser's site settings (usually the
   lock/camera icon in the address bar) and allow camera access, then click
   Start Session again.
@@ -43,14 +44,31 @@ The Webcam page surfaces these as readable messages, not stack traces:
   laptops, check for a physical privacy shutter or a function-key camera
   toggle.
 
+## Screen/tab capture (Live Transcription's "Screen / Tab" source) doesn't work
+
+- **The option is disabled/greyed out**: your browser doesn't support
+  `getDisplayMedia` (or you're on an insecure `http://` origin other than
+  `localhost` — screen capture requires a secure context). This is a real
+  browser limitation, not a bug to work around; use Webcam instead, or
+  switch to current desktop Chrome, Edge, or Firefox.
+- **"Screen/tab sharing permission was denied"**: you cancelled or denied
+  the browser's own share picker. Click "Screen / Tab" and Start again and
+  choose something in the dialog.
+- **The session stops unexpectedly**: if you stop sharing from the
+  browser's own "Stop sharing" indicator (not this app's Stop button),
+  the session ends the same way clicking Stop would — this is intentional,
+  not a crash.
+- Mobile browsers generally don't support `getDisplayMedia` at all; use
+  Webcam mode there.
+
 ## "Couldn't load the recognition model" on the Webcam page
 
 This means `GET /model/meta` or `GET /model/onnx` failed. Check:
 1. Is the FastAPI ML service running (`http://127.0.0.1:8000/health`)?
 2. Is the Node gateway running and pointed at it
    (`ML_SERVICE_URL` env var, default `http://127.0.0.1:8000/process`)?
-3. Have you actually trained a model yet? `models/sign_recog/checkpoints/demo.pt`
-   and `models/sign_recog/sign_recog.onnx` must exist — see "Training" in
+3. Have you actually trained a model yet? `models/sign_recog_v2/checkpoints/demo.pt`
+   and `models/sign_recog_v2/sign_recog.onnx` must exist — see "Training" in
    `README.md`.
 
 ## LLM notes always fall back to template mode
@@ -85,18 +103,17 @@ automatically as a transitive dependency.
 
 ## `mediapipe.solutions` doesn't exist / AttributeError on `mp.solutions.hands`
 
-Some `mediapipe` wheel builds — particularly certain Linux
-sandboxed/minimal environments — ship without the legacy `solutions` API
-(`feature_extraction.py` uses `mediapipe.solutions.hands`, the same API
-MediaPipe has supported for years). If you hit this:
-- Confirm you're on a standard desktop install (Windows/Mac/typical Linux
-  desktop) — this is what the project is developed and tested against.
-- Try `pip install --force-reinstall mediapipe` to get a full wheel for
-  your platform.
-- This is unrelated to the browser webcam feature, which uses a completely
-  different, browser-native MediaPipe package
-  (`@mediapipe/tasks-vision`) and doesn't depend on the Python
-  `mediapipe.solutions` API at all.
+This isn't a platform quirk — the legacy `mediapipe.solutions` API (which
+`feature_extraction.py` used to use) was **removed entirely** from
+current `mediapipe` PyPI releases (confirmed directly: `mediapipe==0.10.33`
+ships `mediapipe.tasks` only, no `solutions` attribute at all, on every
+platform). `feature_extraction.py` has since been migrated to the Tasks
+API (`mediapipe.tasks.python.vision.HolisticLandmarker`) for exactly this
+reason, alongside the hand+body+face schema v2 migration — see
+`FEATURE_SCHEMA.md`. If you're on an older checked-out version of this
+repo that still imports `mp.solutions.hands`, update to the current
+`feature_extraction.py`, or pin `mediapipe<0.10.0` as a stopgap (not
+recommended — you'd also need to stay on schema v1 / 126-dim features).
 
 ## `npm install` fails in `frontend/` with a peer dependency conflict
 
@@ -129,3 +146,51 @@ predictions with their confidence when nothing crosses `threshold`
 (`[api] No window crossed threshold=...`), which tells you whether the
 model is close-but-under-threshold (lower the threshold) or genuinely
 confused (retrain / check the vocabulary actually includes that sign).
+
+## PyTorch won't install, or crashes on `import torch` after installing
+
+On a disk-constrained machine (this happened while building this
+project, in a sandboxed container), a plain `pip install torch` on Linux
+can fail or leave a broken partial install: the default PyPI wheel pulls
+in several GB of CUDA dependency packages (`nvidia-cublas-cu12`,
+`nvidia-cudnn-*`, etc.) even if you don't have an NVIDIA GPU, and if that
+download is interrupted partway (out of disk space), `import torch` then
+fails with something like `ModuleNotFoundError: No module named
+'torch._strobelight'` or `libcublasLt.so not found`. If you hit this:
+- Free disk space and retry a full `pip install --force-reinstall torch`
+  (the CUDA wheels are large — budget several GB free).
+- If you don't have an NVIDIA GPU and don't need CUDA, install a CPU-only
+  build instead: see
+  [pytorch.org/get-started](https://pytorch.org/get-started/locally/) and
+  select the CPU option — this avoids the large CUDA downloads entirely.
+- A `pip uninstall torch` followed by manually deleting any leftover
+  `nvidia*`/`triton*` directories under your Python environment's
+  `site-packages` clears a broken partial install before retrying.
+
+## `evaluate.py` says "nothing to evaluate" or can't find a test split
+
+`evaluate.py` deliberately has **no fallback** here (see
+`split_utils.resolve_test_indices()`): if `data/index.csv` has no
+`split` column, or the column has no rows labeled `test`, it raises an
+error rather than silently evaluating against validation or training
+rows instead — using a leakage-free held-out test set is the entire
+point of this script (project brief RULE 11/16). Check that:
+1. Your metadata CSV actually has a `split` column with `test` values
+   (`data/data_meta/metadata*.csv`).
+2. `build_index.py` was run against that metadata CSV, so `data/index.csv`
+   carries the `split` column through.
+3. Features were extracted for those specific test-split videos (not
+   just train/val) — see `feature_extraction.py --splits test`.
+
+## Word (.docx) export produces an error or a file Word won't open
+
+- Check the browser console for the actual error — `NotesPanel`'s Export
+  row shows a short message under the buttons if generation fails, but
+  the console has the full stack trace.
+- This uses the `docx` npm package, dynamically loaded on first use (not
+  bundled into the initial page load) — if your network blocks that chunk
+  from loading (e.g. a very restrictive corporate proxy), the PDF export
+  and other formats will still work since they're separate code paths.
+- If the download starts but the file won't open in Word: confirm the
+  file actually finished downloading (check its size isn't 0 bytes) --
+  a browser tab closed mid-generation can produce a truncated file.

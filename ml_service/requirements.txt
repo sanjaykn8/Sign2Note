@@ -8,6 +8,10 @@ numpy
 # Data
 pandas
 tqdm
+# Evaluation (evaluate.py / eval_metrics.py) -- Top-k accuracy, macro/
+# weighted F1, per-class precision/recall/f1, confusion matrix + PNG
+scikit-learn
+matplotlib
 # ONNX export/runtime
 onnx
 onnxruntime          # CPU runtime

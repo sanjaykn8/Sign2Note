@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { FileText, Pencil, Check, X, RefreshCw, Download } from "lucide-react";
 import { renderMarkdown } from "@/lib/markdown";
-import { downloadMarkdown, downloadPlainText, downloadPdf, slugify } from "@/lib/notesExport";
+import { downloadMarkdown, downloadPlainText, downloadPdf, downloadDocx, slugify } from "@/lib/notesExport";
 
 interface NotesPanelProps {
   /** The generated Markdown. When this prop changes (e.g. after a
@@ -15,19 +15,21 @@ interface NotesPanelProps {
   regenerating?: boolean;
 }
 
+type ExportFormat = "pdf" | "docx";
+
 /**
  * "Preview -> Edit -> Export" notes panel (workplan section 7/8): renders
  * the notes as Markdown, lets the user fix misrecognized signs inline
- * before committing to a download, and offers Markdown/Text/PDF export.
- * Deliberately NOT "Generate -> immediately download" -- the student
- * reviews first.
+ * before committing to a download, and offers Markdown/Text/PDF/DOCX
+ * export. Deliberately NOT "Generate -> immediately download" -- the
+ * student reviews first.
  */
 export default function NotesPanel({ markdown, title = "Lecture Notes", durationSeconds, onRegenerate, regenerating }: NotesPanelProps) {
   const [current, setCurrent] = useState(markdown);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(markdown);
-  const [pdfBusy, setPdfBusy] = useState(false);
-  const [pdfError, setPdfError] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState<ExportFormat | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
 
   // Re-sync when the parent hands us freshly (re)generated notes.
   useEffect(() => {
@@ -47,15 +49,19 @@ export default function NotesPanel({ markdown, title = "Lecture Notes", duration
     setEditing(false);
   };
 
-  const handlePdf = async () => {
-    setPdfBusy(true);
-    setPdfError(null);
+  const handleExport = async (format: ExportFormat) => {
+    setExportBusy(format);
+    setExportError(null);
     try {
-      await downloadPdf(`${slug}.pdf`, current, { title, durationSeconds });
+      if (format === "pdf") {
+        await downloadPdf(`${slug}.pdf`, current, { title, durationSeconds });
+      } else {
+        await downloadDocx(`${slug}.docx`, current, { title, durationSeconds });
+      }
     } catch (err) {
-      setPdfError(err instanceof Error ? err.message : "Couldn't generate the PDF.");
+      setExportError(err instanceof Error ? err.message : `Couldn't generate the ${format.toUpperCase()}.`);
     } finally {
-      setPdfBusy(false);
+      setExportBusy(null);
     }
   };
 
@@ -118,12 +124,16 @@ export default function NotesPanel({ markdown, title = "Lecture Notes", duration
             <Download className="h-3.5 w-3.5 mr-1.5" />
             Text
           </Button>
-          <Button size="sm" variant="secondary" onClick={handlePdf} disabled={pdfBusy}>
+          <Button size="sm" variant="secondary" onClick={() => handleExport("pdf")} disabled={exportBusy !== null}>
             <Download className="h-3.5 w-3.5 mr-1.5" />
-            {pdfBusy ? "Preparing…" : "PDF"}
+            {exportBusy === "pdf" ? "Preparing…" : "PDF"}
+          </Button>
+          <Button size="sm" variant="secondary" onClick={() => handleExport("docx")} disabled={exportBusy !== null}>
+            <Download className="h-3.5 w-3.5 mr-1.5" />
+            {exportBusy === "docx" ? "Preparing…" : "Word (.docx)"}
           </Button>
         </div>
-        {pdfError && <p className="text-xs text-destructive">{pdfError}</p>}
+        {exportError && <p className="text-xs text-destructive">{exportError}</p>}
       </CardContent>
     </Card>
   );

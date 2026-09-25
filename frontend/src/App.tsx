@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import AppNav from "@/components/AppNav";
 import Index from "./pages/Index.tsx";
 import Webcam from "./pages/Webcam.tsx";
+import LiveTranscription from "./pages/LiveTranscription.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
 const queryClient = new QueryClient();
@@ -20,6 +21,7 @@ const App = () => (
         <Routes>
           <Route path="/" element={<Index />} />
           <Route path="/webcam" element={<Webcam />} />
+          <Route path="/live-transcription" element={<LiveTranscription />} />
           {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
           <Route path="*" element={<NotFound />} />
         </Routes>

@@ -1,88 +1,30 @@
 import { describe, it, expect } from "vitest";
 import {
-  keypointsFromLandmarks,
-  normalizeWindow,
   KeypointBuffer,
   SessionSmoother,
   softmaxArgmax,
   DEFAULT_SMOOTHING,
 } from "../webcamPipeline";
 
-describe("keypointsFromLandmarks", () => {
-  it("returns all zeros when no hands are detected", () => {
-    const vec = keypointsFromLandmarks([]);
-    expect(vec.length).toBe(126);
-    expect(Array.from(vec).every((v) => v === 0)).toBe(true);
-  });
-
-  it("places the first detected hand in slot 0 (first 63 values), zero-pads the rest", () => {
-    const hand = Array.from({ length: 21 }, (_, i) => ({ x: i * 0.01, y: i * 0.02, z: i * 0.03 }));
-    const vec = keypointsFromLandmarks([hand]);
-    expect(vec[0]).toBeCloseTo(0);
-    expect(vec[1]).toBeCloseTo(0);
-    expect(vec[2]).toBeCloseTo(0);
-    expect(vec[60]).toBeCloseTo(20 * 0.01); // landmark 20's x
-    // second hand slot (indices 63..125) must be all zero
-    expect(Array.from(vec.slice(63)).every((v) => v === 0)).toBe(true);
-  });
-
-  it("places a second detected hand starting at index 63, by detection order not handedness", () => {
-    const handA = Array.from({ length: 21 }, () => ({ x: 1, y: 1, z: 1 }));
-    const handB = Array.from({ length: 21 }, () => ({ x: 2, y: 2, z: 2 }));
-    const vec = keypointsFromLandmarks([handA, handB]);
-    expect(vec[0]).toBe(1);
-    expect(vec[63]).toBe(2);
-  });
-
-  it("ignores hands beyond the first two", () => {
-    const h = (v: number) => Array.from({ length: 21 }, () => ({ x: v, y: v, z: v }));
-    const vec = keypointsFromLandmarks([h(1), h(2), h(3)]);
-    expect(vec.length).toBe(126);
-    expect(vec[0]).toBe(1);
-    expect(vec[63]).toBe(2);
-  });
-});
-
-describe("normalizeWindow", () => {
-  it("produces zero-mean, unit-ish-variance per feature dimension across time", () => {
-    const frames = 10;
-    const dims = 4;
-    const window = new Float32Array(frames * dims);
-    for (let f = 0; f < frames; f++) {
-      for (let d = 0; d < dims; d++) window[f * dims + d] = f * (d + 1); // linear ramp per dim
-    }
-    const normalized = normalizeWindow(window, frames, dims);
-    for (let d = 0; d < dims; d++) {
-      let mean = 0;
-      for (let f = 0; f < frames; f++) mean += normalized[f * dims + d];
-      mean /= frames;
-      expect(mean).toBeCloseTo(0, 5);
-    }
-  });
-
-  it("does not divide by zero for a constant (zero-variance) dimension", () => {
-    const frames = 5;
-    const dims = 1;
-    const window = new Float32Array(frames).fill(3.0);
-    const normalized = normalizeWindow(window, frames, dims);
-    expect(Array.from(normalized).every((v) => Number.isFinite(v))).toBe(true);
-  });
-
-  it("matches a hand-computed reference for a small case", () => {
-    // frames=3, dims=1: values [1, 2, 3] -> mean=2, std=sqrt(((1)^2+0+1)/3)=sqrt(0.6667)
-    const window = new Float32Array([1, 2, 3]);
-    const normalized = normalizeWindow(window, 3, 1);
-    const std = Math.sqrt(((1 - 2) ** 2 + (2 - 2) ** 2 + (3 - 2) ** 2) / 3) + 1e-5;
-    expect(normalized[0]).toBeCloseTo((1 - 2) / std, 4);
-    expect(normalized[1]).toBeCloseTo((2 - 2) / std, 4);
-    expect(normalized[2]).toBeCloseTo((3 - 2) / std, 4);
-  });
-});
+// NOTE: feature-vector construction (buildFeatureVector) and normalization
+// (normalizeSequence) used to be tested here directly, back when they
+// lived in this file as hand-only (126-dim) functions. They've since
+// moved to featureSchema.ts as part of the hand+body+face schema v2
+// migration -- see featureSchema.test.ts for their unit tests, and
+// featureSchema.crosscheck.test.ts for the cross-language golden-vector
+// test against ml_service/feature_schema.py.
 
 describe("KeypointBuffer", () => {
   it("returns null when empty", () => {
     const buf = new KeypointBuffer(4, 2);
     expect(buf.getNormalizedWindow()).toBeNull();
+  });
+
+  it("defaults to FEATURE_DIM (285, hand+body+face) when dims isn't specified", () => {
+    const buf = new KeypointBuffer(3);
+    buf.push(new Float32Array(285).fill(1));
+    const win = buf.getNormalizedWindow()!;
+    expect(win.length).toBe(3 * 285);
   });
 
   it("zero-pads at the END when fewer than maxLen frames have been pushed", () => {
@@ -91,9 +33,9 @@ describe("KeypointBuffer", () => {
     buf.push(new Float32Array([1, 1]));
     const win = buf.getNormalizedWindow()!;
     expect(win.length).toBe(4 * 2);
-    // last two frames (padding) should normalize the SAME zero value
-    // differently from the real frames -- just check shape/finiteness here,
-    // exact values are covered by the normalizeWindow tests above.
+    // last two frames (padding) get normalized along with the real ones --
+    // just check shape/finiteness here; exact normalization values are
+    // covered by featureSchema.test.ts's normalizeSequence tests.
     expect(Array.from(win).every((v) => Number.isFinite(v))).toBe(true);
   });
 

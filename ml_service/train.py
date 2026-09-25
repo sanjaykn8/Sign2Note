@@ -1,4 +1,11 @@
-"""Train the Sign2Notes Temporal CNN on extracted keypoints."""
+"""Train the Sign2Notes recognition model on extracted keypoints.
+
+Default architecture is TemporalCNN (unchanged, ~83.5%-class-era baseline
+-- see README.md's experiment results table). --architecture cnn_bilstm
+is an OPTIONAL experiment (project brief section 9); it is not
+automatically preferred just because it's more complex -- see
+model_selection notes in README.md for how to decide between them.
+"""
 import argparse
 import json
 from multiprocessing import freeze_support
@@ -10,22 +17,37 @@ import torch.optim as optim
 from torch.cuda.amp import GradScaler
 from torch import autocast
 from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, Subset
 from dataset import SignDataset
-from model import TemporalCNN
+from model import build_model
+from checkpoint_meta import SUPPORTED_ARCHITECTURES, DEFAULT_ARCHITECTURE, build_checkpoint_metadata
+from split_utils import resolve_train_val_indices
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--index_csv", default="data/index.csv")
-    p.add_argument("--feature_dir", default="data/features")
-    p.add_argument("--out_dir", default="models/sign_recog/checkpoints")
+    p.add_argument("--feature_dir", default="data/features_v2")
+    p.add_argument("--out_dir", default="models/sign_recog_v2/checkpoints")
+    p.add_argument("--architecture", choices=SUPPORTED_ARCHITECTURES, default=DEFAULT_ARCHITECTURE,
+                    help="Model architecture. Default (temporal_cnn) is the evidence-backed "
+                         "baseline; cnn_bilstm is an optional experiment (RULE 2).")
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--max_len", type=int, default=64)
-    p.add_argument("--val_split", type=float, default=0.15)
+    # --- official split (RULE 16) ---
+    p.add_argument("--split_col", default="split",
+                    help="Column in index_csv holding official train/val/test labels "
+                         "(written by build_index.py from the FDMSE metadata CSV).")
+    p.add_argument("--force_random_split", action="store_true",
+                    help="Ignore an official split column even if present, and use a random "
+                         "--val_split instead. For quick experiments only -- the final "
+                         "evaluation should always use the official split (RULE 16).")
+    p.add_argument("--val_split", type=float, default=0.15,
+                    help="Fraction held out for validation when no usable official split "
+                         "column exists (or --force_random_split is set).")
     p.add_argument("--no_amp", action="store_true")
     p.add_argument("--seed", type=int, default=42)
     # --- regularization / schedule knobs ---
@@ -96,17 +118,15 @@ def main():
         "train_dataset and val_dataset should see the same index_csv/rows"
 
     n = len(train_dataset)
-    val_size = max(1, int(n * args.val_split))
-    train_size = n - val_size
-    train_idx_split, val_idx_split = random_split(
-        range(n), [train_size, val_size],
-        generator=torch.Generator().manual_seed(args.seed),
+    train_idx_list, val_idx_list, used_official_split = resolve_train_val_indices(
+        args.index_csv, args.split_col, args.force_random_split, args.val_split, args.seed, n,
     )
-    train_ds = Subset(train_dataset, train_idx_split.indices)
-    val_ds = Subset(val_dataset, val_idx_split.indices)
+    train_ds = Subset(train_dataset, train_idx_list)
+    val_ds = Subset(val_dataset, val_idx_list)
 
     print(f"Dataset: {n} samples | train={len(train_ds)} (augment={not args.no_augment}) | "
-          f"val={len(val_ds)} (augment=False)")
+          f"val={len(val_ds)} (augment=False) | official_split={used_official_split} | "
+          f"architecture={args.architecture}")
 
     loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
@@ -124,7 +144,7 @@ def main():
     # is as good a source as train_dataset here.
     input_dim = val_dataset[0][0].shape[1]
     num_classes = len(val_dataset.label2id)
-    model = TemporalCNN(input_dim, num_classes).to(device)
+    model = build_model(args.architecture, input_dim, num_classes).to(device)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -133,6 +153,19 @@ def main():
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # A single training_config snapshot, saved into EVERY checkpoint this
+    # run produces, so a checkpoint is self-describing months later
+    # without needing to dig up whatever command line produced it.
+    training_config = {
+        "index_csv": args.index_csv, "feature_dir": args.feature_dir,
+        "epochs": args.epochs, "batch_size": args.batch_size, "lr": args.lr,
+        "label_smoothing": args.label_smoothing, "warmup_epochs": args.warmup_epochs,
+        "min_lr": args.min_lr, "patience": args.patience, "min_delta": args.min_delta,
+        "grad_clip": args.grad_clip, "augment": not args.no_augment, "seed": args.seed,
+        "used_official_split": used_official_split, "val_split": args.val_split,
+        "num_train_samples": len(train_ds), "num_val_samples": len(val_ds),
+    }
 
     best_acc = -1.0
     epochs_no_improve = 0
@@ -184,12 +217,12 @@ def main():
         if val_acc > best_acc + args.min_delta:
             best_acc = val_acc
             epochs_no_improve = 0
-            torch.save({
-                "model": model.state_dict(),
-                "label2id": val_dataset.label2id,
-                "input_dim": input_dim,
-                "max_len": args.max_len,
-            }, out_dir / "best.pt")
+            torch.save(build_checkpoint_metadata(
+                model_state=model.state_dict(), label2id=val_dataset.label2id,
+                input_dim=input_dim, max_len=args.max_len, architecture=args.architecture,
+                best_val_accuracy=best_acc, training_config=training_config,
+                stopped_early=False,
+            ), out_dir / "best.pt")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= args.patience:
@@ -198,12 +231,12 @@ def main():
                 stopped_early = True
                 break
 
-    torch.save({
-        "model": model.state_dict(),
-        "label2id": val_dataset.label2id,
-        "input_dim": input_dim,
-        "max_len": args.max_len,
-    }, out_dir / "demo.pt")
+    torch.save(build_checkpoint_metadata(
+        model_state=model.state_dict(), label2id=val_dataset.label2id,
+        input_dim=input_dim, max_len=args.max_len, architecture=args.architecture,
+        best_val_accuracy=best_acc, training_config=training_config,
+        stopped_early=stopped_early,
+    ), out_dir / "demo.pt")
 
     # Export ONNX with dynamic batch dimension. Reload best weights so the
     # exported graph matches the checkpoint that scored best_acc, not
@@ -220,11 +253,15 @@ def main():
         dynamic_axes={"keypoints": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
     )
-    meta = {"input_dim": input_dim, "max_len": args.max_len,
-            "num_classes": num_classes, "best_val_accuracy": best_acc,
-            "stopped_early": stopped_early, "augmented": not args.no_augment}
-    Path(onnx_path).with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    print(f"Saved best.pt, demo.pt and {onnx_path}")
+    # ONNX meta.json mirrors the checkpoint's own metadata (minus the
+    # weights themselves) so the browser / api.py's /model/meta can read
+    # it without touching the .pt file at all.
+    onnx_meta = {k: v for k, v in best_ckpt.items() if k != "model"}
+    onnx_meta["num_classes"] = num_classes
+    Path(onnx_path).with_suffix(".json").write_text(json.dumps(onnx_meta, indent=2), encoding="utf-8")
+    print(f"Saved best.pt, demo.pt and {onnx_path} "
+          f"(architecture={args.architecture}, feature_schema_version={best_ckpt['feature_schema_version']}, "
+          f"best_val_accuracy={best_acc:.4f})")
 
 
 if __name__ == "__main__":

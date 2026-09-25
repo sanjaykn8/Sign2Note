@@ -7,6 +7,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+import feature_schema as fs
+
 
 class SignDataset(Dataset):
     def __init__(
@@ -315,6 +317,7 @@ class SignDataset(Dataset):
         x = np.load(feature_path).astype(
             np.float32
         )
+        fs.assert_feature_dim(x.shape[-1], context=str(feature_path))
 
         # ---------------------------------------------------------
         # IMPORTANT:
@@ -327,20 +330,15 @@ class SignDataset(Dataset):
         x = self.pad_or_trim(x)
 
         # ---------------------------------------------------------
-        # Per-video normalization
+        # Per-video normalization -- feature_schema.normalize_sequence()
+        # is the single shared implementation infer.py also calls (see
+        # FEATURE_SCHEMA.md "Normalization"); pad_or_trim() above stays
+        # here rather than also moving into feature_schema.py because it
+        # carries dataset-specific augmentation policy (random-crop during
+        # training) that inference deliberately does not use.
         # ---------------------------------------------------------
 
-        mean = x.mean(
-            axis=0,
-            keepdims=True
-        )
-
-        std = x.std(
-            axis=0,
-            keepdims=True
-        ) + 1e-5
-
-        x = (x - mean) / std
+        x = fs.normalize_sequence(x)
 
         label = self.label2id[
             row["label"]

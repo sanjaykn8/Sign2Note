@@ -1,297 +1,42 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Progress } from "@/components/ui/progress";
 import PrivacyBanner from "@/components/PrivacyBanner";
 import NotesPanel from "@/components/NotesPanel";
-import { getModelMeta, getModelOnnxBytes, generateNotesFromGlosses, type ModelMeta, type NotesMode } from "@/lib/api";
-import { loadHandLandmarker, detectHands } from "@/lib/handLandmarker";
-import { loadOnnxSession, runInference } from "@/lib/onnxSession";
-import { KeypointBuffer, SessionSmoother, keypointsFromLandmarks, softmaxArgmax, DEFAULT_SMOOTHING, type PredictionEvent } from "@/lib/webcamPipeline";
+import { generateNotesFromGlosses, type NotesMode } from "@/lib/api";
+import { useSignRecognitionSession } from "@/lib/useSignRecognitionSession";
 import { Camera, Square, Trash2, FileText, AlertTriangle, Hand, Pencil, Check, X, Undo2, Play, Pause as PauseIcon } from "lucide-react";
 
-type CameraState = "idle" | "requesting" | "active" | "error";
-type ModelState = "idle" | "loading" | "ready" | "error";
-type CurrentSign = { label: string; confidence: number } | "uncertain" | "no_sign" | null;
-
-// How often to run hand-landmark detection + inference, in ms. Chosen to
-// roughly match the training-time sampling cadence: frame_skip=8 at a
-// typical 25-30fps source video is one kept frame per ~270-320ms. This is
-// an approximation (browsers don't give exact frame-count control the way
-// offline video decoding does) -- documented in ARCHITECTURE.md.
-const DETECTION_INTERVAL_MS = 280;
-
 export default function Webcam() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const streamRef = useRef<MediaStream | null>(null);
-  const rafRef = useRef<number | null>(null);
-  const lastDetectionRef = useRef<number>(0);
-  const detectingRef = useRef(false);
-  const bufferRef = useRef<KeypointBuffer | null>(null);
-  const smootherRef = useRef<SessionSmoother>(new SessionSmoother(DEFAULT_SMOOTHING));
-  const sessionStartRef = useRef<number>(0);
-  const pausedRef = useRef(false);
-  const pauseStartRef = useRef<number | null>(null);
-  const totalPausedMsRef = useRef(0);
-  const onnxSessionRef = useRef<Awaited<ReturnType<typeof loadOnnxSession>> | null>(null);
-  const landmarkerRef = useRef<Awaited<ReturnType<typeof loadHandLandmarker>> | null>(null);
-  const modelMetaRef = useRef<ModelMeta | null>(null);
+  const session = useSignRecognitionSession();
+  const {
+    videoRef, canvasRef, cameraState, cameraError, modelState, modelError,
+    sessionActive, paused, current, history, editingIndex, editDraft, setEditDraft,
+    startSession, stopSession, pauseSession, resumeSession, clearSession,
+    undoLast, deleteEvent, startEdit, saveEdit, cancelEdit, elapsedSessionSeconds,
+  } = session;
 
-  const [cameraState, setCameraState] = useState<CameraState>("idle");
-  const [cameraError, setCameraError] = useState<string | null>(null);
-  const [modelState, setModelState] = useState<ModelState>("idle");
-  const [modelError, setModelError] = useState<string | null>(null);
-  const [sessionActive, setSessionActive] = useState(false);
-  const [paused, setPaused] = useState(false);
-  const [current, setCurrent] = useState<CurrentSign>(null);
-  const [history, setHistory] = useState<PredictionEvent[]>([]);
-  const [editingIndex, setEditingIndex] = useState<number | null>(null);
-  const [editDraft, setEditDraft] = useState("");
   const [notes, setNotes] = useState<string | null>(null);
   const [notesDuration, setNotesDuration] = useState<number | undefined>(undefined);
   const [notesMode, setNotesMode] = useState<NotesMode>("template");
   const [generating, setGenerating] = useState(false);
   const [notesError, setNotesError] = useState<string | null>(null);
 
-  // Load model metadata + ONNX weights + hand landmarker once, up front,
-  // WITHOUT requesting camera access -- camera permission is only
-  // requested when the user explicitly clicks Start Session.
-  useEffect(() => {
-    let cancelled = false;
-    setModelState("loading");
-    (async () => {
-      try {
-        const [meta, onnxBytes] = await Promise.all([getModelMeta(), getModelOnnxBytes()]);
-        if (cancelled) return;
-        modelMetaRef.current = meta;
-        const session = await loadOnnxSession(onnxBytes);
-        if (cancelled) return;
-        onnxSessionRef.current = session;
-        bufferRef.current = new KeypointBuffer(meta.max_len, meta.input_dim);
-        setModelState("ready");
-      } catch (err: any) {
-        if (cancelled) return;
-        setModelError(
-          err?.message?.includes("404") || err?.message?.includes("No trained") || err?.message?.includes("No ONNX")
-            ? "No trained model found on the backend. Run train.py to produce a checkpoint and ONNX export first."
-            : `Couldn't load the recognition model: ${err?.message || err}`
-        );
-        setModelState("error");
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const stopCamera = useCallback(() => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = null;
-    streamRef.current?.getTracks().forEach((t) => t.stop());
-    streamRef.current = null;
-    if (videoRef.current) videoRef.current.srcObject = null;
-  }, []);
-
-  useEffect(() => stopCamera, [stopCamera]);
-
-  const drawOverlay = (hands: { x: number; y: number }[][]) => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-    if (!canvas || !video) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "#22c55e";
-    for (const hand of hands) {
-      for (const pt of hand) {
-        ctx.beginPath();
-        ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 3, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-  };
-
-  const elapsedSessionSeconds = () =>
-    (performance.now() - sessionStartRef.current - totalPausedMsRef.current) / 1000;
-
-  const detectLoop = useCallback((timestampMs: number) => {
-    rafRef.current = requestAnimationFrame(detectLoop);
-    if (pausedRef.current) return;
-    if (timestampMs - lastDetectionRef.current < DETECTION_INTERVAL_MS) return;
-    if (detectingRef.current) return;
-    lastDetectionRef.current = timestampMs;
-
-    const video = videoRef.current;
-    const landmarker = landmarkerRef.current;
-    const session = onnxSessionRef.current;
-    const meta = modelMetaRef.current;
-    const buffer = bufferRef.current;
-    if (!video || !landmarker || !session || !meta || !buffer) return;
-    if (video.readyState < 2) return;
-
-    detectingRef.current = true;
-    (async () => {
-      try {
-        const { hands } = detectHands(landmarker, video, timestampMs);
-        drawOverlay(hands as any);
-        const vec = keypointsFromLandmarks(hands);
-        buffer.push(vec);
-
-        const window = buffer.getNormalizedWindow();
-        if (!window) return;
-
-        const logits = await runInference(session, window, meta.max_len, meta.input_dim);
-        const { index, confidence } = softmaxArgmax(logits);
-        const label = meta.id2label[String(index)] ?? `class_${index}`;
-
-        const result = smootherRef.current.update(label, confidence, elapsedSessionSeconds());
-
-        if (result.status === "no_sign") {
-          setCurrent("no_sign");
-        } else if (result.status === "uncertain") {
-          setCurrent("uncertain");
-        } else {
-          setCurrent({ label, confidence });
-        }
-        if (result.status === "committed") {
-          setHistory((h) => [...h, result.event]);
-        }
-      } catch (err) {
-        // Swallow per-tick inference errors so a single bad frame doesn't
-        // kill the whole session -- surface nothing to the user unless it
-        // keeps happening (that would already show as "uncertain" forever).
-        console.error("[webcam] detection tick failed:", err);
-      } finally {
-        detectingRef.current = false;
-      }
-    })();
-  }, []);
-
-  const startSession = async () => {
-    setCameraError(null);
-    setCameraState("requesting");
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
-      streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play();
-      }
-      setCameraState("active");
-
-      if (!landmarkerRef.current) {
-        landmarkerRef.current = await loadHandLandmarker();
-      }
-
-      bufferRef.current?.clear();
-      smootherRef.current.reset();
-      sessionStartRef.current = performance.now();
-      totalPausedMsRef.current = 0;
-      pauseStartRef.current = null;
-      pausedRef.current = false;
-      lastDetectionRef.current = 0;
-      setPaused(false);
-      setHistory([]);
-      setEditingIndex(null);
-      setCurrent(null);
-      setNotes(null);
-      setNotesDuration(undefined);
-      setNotesError(null);
-      setSessionActive(true);
-      rafRef.current = requestAnimationFrame(detectLoop);
-    } catch (err: any) {
-      setCameraState("error");
-      if (err?.name === "NotAllowedError") {
-        setCameraError("Camera permission was denied. Allow camera access in your browser's site settings and try again.");
-      } else if (err?.name === "NotFoundError") {
-        setCameraError("No camera was found on this device.");
-      } else if (err?.message?.includes("hand landmark") || err?.message?.toLowerCase().includes("fetch")) {
-        setCameraError(`Couldn't load the hand-tracking model (check your internet connection for the one-time model download): ${err.message}`);
-      } else {
-        setCameraError(`Couldn't start the camera: ${err?.message || err}`);
-      }
-    }
-  };
-
-  const stopSession = () => {
-    stopCamera();
-    setSessionActive(false);
-    setPaused(false);
-    pausedRef.current = false;
-    pauseStartRef.current = null;
-    setCameraState("idle");
-    setCurrent(null);
-  };
-
-  const pauseSession = () => {
-    if (!sessionActive || pausedRef.current) return;
-    pausedRef.current = true;
-    pauseStartRef.current = performance.now();
-    setPaused(true);
-    setCurrent(null);
-  };
-
-  const resumeSession = () => {
-    if (!sessionActive || !pausedRef.current) return;
-    if (pauseStartRef.current !== null) {
-      totalPausedMsRef.current += performance.now() - pauseStartRef.current;
-      pauseStartRef.current = null;
-    }
-    pausedRef.current = false;
-    setPaused(false);
-  };
-
-  const clearSession = () => {
-    setHistory([]);
-    setEditingIndex(null);
-    setCurrent(null);
+  const handleStartSession = async () => {
     setNotes(null);
     setNotesDuration(undefined);
     setNotesError(null);
-    smootherRef.current.reset();
+    await startSession("webcam");
   };
 
-  const undoLast = () => {
-    setHistory((h) => {
-      if (h.length === 0) return h;
-      const next = h.slice(0, -1);
-      smootherRef.current.forgetLastCommitted(next.length > 0 ? next[next.length - 1].label : null);
-      return next;
-    });
-    setEditingIndex(null);
+  const handleClearSession = () => {
+    clearSession();
+    setNotes(null);
+    setNotesDuration(undefined);
+    setNotesError(null);
   };
-
-  const deleteEvent = (index: number) => {
-    setHistory((h) => {
-      const next = h.filter((_, i) => i !== index);
-      // If we just removed the most recent event, let the smoother forget
-      // it so a genuine repeat of that sign can be committed again later.
-      if (index === h.length - 1) {
-        smootherRef.current.forgetLastCommitted(next.length > 0 ? next[next.length - 1].label : null);
-      }
-      return next;
-    });
-    setEditingIndex(null);
-  };
-
-  const startEdit = (index: number) => {
-    setEditingIndex(index);
-    setEditDraft(history[index].label);
-  };
-
-  const saveEdit = (index: number) => {
-    const cleaned = editDraft.trim().toUpperCase();
-    if (cleaned) {
-      setHistory((h) => h.map((e, i) => (i === index ? { ...e, label: cleaned } : e)));
-    }
-    setEditingIndex(null);
-  };
-
-  const cancelEdit = () => setEditingIndex(null);
 
   const handleGenerateNotes = async () => {
     if (history.length === 0) return;
@@ -356,7 +101,7 @@ export default function Webcam() {
 
             <div className="flex flex-wrap gap-2">
               {!sessionActive ? (
-                <Button onClick={startSession} disabled={modelState !== "ready" || cameraState === "requesting"}>
+                <Button onClick={handleStartSession} disabled={modelState !== "ready" || cameraState === "requesting"}>
                   <Camera className="h-4 w-4 mr-2" />
                   Start Session
                 </Button>
@@ -383,7 +128,7 @@ export default function Webcam() {
                 <Undo2 className="h-4 w-4 mr-2" />
                 Undo
               </Button>
-              <Button onClick={clearSession} variant="outline" disabled={history.length === 0 && !notes}>
+              <Button onClick={handleClearSession} variant="outline" disabled={history.length === 0 && !notes}>
                 <Trash2 className="h-4 w-4 mr-2" />
                 Clear Session
               </Button>

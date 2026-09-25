@@ -1,87 +1,38 @@
 /**
  * Pure, browser-API-free logic for the live webcam recognition pipeline.
- * Kept separate from onnxSession.ts/handLandmarker.ts (which touch actual
- * browser APIs) specifically so it can be unit-tested with plain Vitest --
- * no DOM, no WASM, no camera required.
+ * Kept separate from onnxSession.ts/holisticLandmarker.ts (which touch
+ * actual browser APIs) specifically so it can be unit-tested with plain
+ * Vitest -- no DOM, no WASM, no camera required.
  *
  * Every function here must stay numerically consistent with the Python
  * training/inference pipeline (ml_service/feature_extraction.py and
  * ml_service/infer.py) -- see the docstring on each function for exactly
  * which Python function it mirrors and why.
+ *
+ * Schema v2 note: the actual hand+body+face feature vector construction
+ * and normalization now live in featureSchema.ts (the canonical schema
+ * shared with ml_service/feature_schema.py -- see FEATURE_SCHEMA.md), not
+ * here. This file re-exports what it needs from there so existing
+ * imports of `Landmark` from this module keep working, and focuses on
+ * what's actually specific to the live session: buffering frames and the
+ * real-time stability/commit state machine.
  */
 
-export interface Landmark {
-  x: number;
-  y: number;
-  z: number;
-}
-
-/**
- * Mirrors feature_extraction.py's `_extract_keypoints()`: 126-dim vector =
- * first-detected hand's 21 landmarks (x,y,z flattened) in the first 63
- * slots, second-detected hand's landmarks in the next 63 slots, zero-padded
- * if fewer than 2 hands are visible. NOTE: this is ordered by MediaPipe's
- * detection order, NOT by actual left/right handedness -- the Python
- * extractor doesn't use the handedness label either, so this must not be
- * "improved" to use real handedness, or it will no longer match what the
- * model was trained on.
- */
-export function keypointsFromLandmarks(hands: Landmark[][]): Float32Array {
-  const out = new Float32Array(126); // already zero-filled
-  for (let h = 0; h < Math.min(hands.length, 2); h++) {
-    const offset = h * 63;
-    const lm = hands[h];
-    for (let i = 0; i < 21 && i < lm.length; i++) {
-      out[offset + i * 3] = lm[i].x;
-      out[offset + i * 3 + 1] = lm[i].y;
-      out[offset + i * 3 + 2] = lm[i].z;
-    }
-  }
-  return out;
-}
-
-/**
- * Mirrors infer.py's `_normalize()`: per-window z-score across the TIME
- * axis independently for each of the 126 feature dimensions (mean/std
- * computed over the window's frames, not across features). `window` is a
- * flat Float32Array of length frames*126 (row-major: frame 0's 126 values,
- * then frame 1's, ...).
- */
-export function normalizeWindow(window: Float32Array, frames: number, dims = 126): Float32Array {
-  const mean = new Float64Array(dims);
-  const std = new Float64Array(dims);
-  for (let f = 0; f < frames; f++) {
-    for (let d = 0; d < dims; d++) mean[d] += window[f * dims + d];
-  }
-  for (let d = 0; d < dims; d++) mean[d] /= frames;
-
-  for (let f = 0; f < frames; f++) {
-    for (let d = 0; d < dims; d++) {
-      const diff = window[f * dims + d] - mean[d];
-      std[d] += diff * diff;
-    }
-  }
-  for (let d = 0; d < dims; d++) std[d] = Math.sqrt(std[d] / frames) + 1e-5;
-
-  const out = new Float32Array(frames * dims);
-  for (let f = 0; f < frames; f++) {
-    for (let d = 0; d < dims; d++) {
-      out[f * dims + d] = (window[f * dims + d] - mean[d]) / std[d];
-    }
-  }
-  return out;
-}
+import { FEATURE_DIM, normalizeSequence } from "./featureSchema";
+export type { Landmark } from "./featureSchema";
+export { buildFeatureVector, FEATURE_DIM } from "./featureSchema";
 
 /**
  * Fixed-size ring buffer of the last `maxLen` per-frame keypoint vectors.
- * Mirrors infer.py's `_pad_window()` when the buffer isn't full yet (zero-
+ * Mirrors ml_service's pad_or_trim() when the buffer isn't full yet (zero-
  * pads at the END, matching Python's np.vstack([x, zeros]) -- i.e. this
  * buffer's window is oldest-frame-first, and short windows are padded
- * after the real frames, not before).
+ * after the real frames, not before). Default `dims` is FEATURE_DIM (285,
+ * the hand+body+face schema) -- pass a different value only for tests.
  */
 export class KeypointBuffer {
   private frames: Float32Array[] = [];
-  constructor(private maxLen: number, private dims = 126) {}
+  constructor(private maxLen: number, private dims = FEATURE_DIM) {}
 
   push(vec: Float32Array) {
     this.frames.push(vec);
@@ -97,15 +48,19 @@ export class KeypointBuffer {
   }
 
   /** Returns a normalized (maxLen * dims) flat Float32Array ready to feed
-   * the model, or null if the buffer is completely empty. */
+   * the model, or null if the buffer is completely empty. Normalization
+   * is featureSchema.normalizeSequence() -- the same function
+   * ml_service/feature_schema.py's normalize_sequence() mirrors, including
+   * excluding pose-visibility dims from z-scoring when dims === FEATURE_DIM
+   * (see FEATURE_SCHEMA.md "Normalization"). */
   getNormalizedWindow(): Float32Array | null {
     if (this.frames.length === 0) return null;
     const flat = new Float32Array(this.maxLen * this.dims);
     for (let f = 0; f < this.frames.length; f++) {
       flat.set(this.frames[f], f * this.dims);
     }
-    // frames beyond this.frames.length stay zero -- matches _pad_window
-    return normalizeWindow(flat, this.maxLen, this.dims);
+    // frames beyond this.frames.length stay zero -- matches pad_or_trim
+    return normalizeSequence(flat, this.maxLen, this.dims);
   }
 }
 

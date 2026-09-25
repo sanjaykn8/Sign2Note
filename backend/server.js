@@ -6,7 +6,12 @@ const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+// Default express.json() limit (100kb) is far too small for /recognize's
+// keypoints payload (a live-recognition burst of a few hundred frames at
+// 285 floats each, as JSON text, can run into single-digit MB) -- raised
+// to comfortably fit that without opening the door to arbitrarily large
+// bodies (25mb is still bounded, matching the spirit of section 39).
+app.use(express.json({ limit: '25mb' }));
 
 // Memory storage: the gateway never writes uploaded video to disk.
 const upload = multer({
@@ -90,6 +95,45 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 app.post('/notes', async (req, res) => {
   try {
     const r = await fetch(`${ML_BASE_URL}/notes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    });
+    const json = await r.json();
+    res.status(r.status).json(json);
+  } catch (err) {
+    res.status(502).json({ error: `ML service unavailable: ${err.message}` });
+  }
+});
+
+// Generate a natural-language transcript from an already-recognized gloss
+// sequence -- Live Transcription mode's "Stop & Generate" step. Separate
+// from /notes: a transcript (flowing prose) and structured notes
+// (headed/bulleted) are different output layers built from different
+// prompts, and the UI can request both from the same gloss list.
+app.post('/transcript', async (req, res) => {
+  try {
+    const r = await fetch(`${ML_BASE_URL}/transcript`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req.body),
+    });
+    const json = await r.json();
+    res.status(r.status).json(json);
+  } catch (err) {
+    res.status(502).json({ error: `ML service unavailable: ${err.message}` });
+  }
+});
+
+// Recognition-only: pre-extracted keypoints -> glosses, no notes, no video.
+// Used by a client that can extract landmarks locally but doesn't have (or
+// hasn't finished loading) a local recognition model -- the distributed
+// fallback path (see ARCHITECTURE.md "Distributed architecture" / RULE 8):
+// keypoints, never raw video, are sent here so the main server's model can
+// do the recognition step instead.
+app.post('/recognize', async (req, res) => {
+  try {
+    const r = await fetch(`${ML_BASE_URL}/recognize`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body),

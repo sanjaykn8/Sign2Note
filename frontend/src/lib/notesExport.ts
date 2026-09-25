@@ -40,11 +40,12 @@ type NoteLine =
   | { kind: "para"; text: string }
   | { kind: "blank" };
 
-function parseNoteLines(markdown: string): NoteLine[] {
+function parseNoteLines(markdown: string, stripEmphasis = true): NoteLine[] {
   const lines: NoteLine[] = [];
   for (const raw of markdown.split("\n")) {
     const line = raw.trimEnd();
-    const stripBold = (s: string) => s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1");
+    const stripBold = (s: string) =>
+      stripEmphasis ? s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1") : s;
 
     if (/^#{1,3}\s+/.test(line)) {
       lines.push({ kind: "heading", text: stripBold(line.replace(/^#{1,3}\s+/, "")) });
@@ -57,6 +58,28 @@ function parseNoteLines(markdown: string): NoteLine[] {
     }
   }
   return lines;
+}
+
+/** Splits a line of text into runs of plain/bold/italic segments, for
+ * renderers (DOCX) that can represent emphasis natively instead of
+ * stripping the `**bold**`/`*italic*` markers like the plain-text/PDF
+ * renderers do. Doesn't handle nested/overlapping emphasis -- the notes
+ * this renders are LLM- or template-generated Markdown, not arbitrary
+ * user Markdown, so that's not a realistic input. Exported for direct
+ * unit testing. */
+export function parseInlineRuns(text: string): { text: string; bold?: boolean; italics?: boolean }[] {
+  const runs: { text: string; bold?: boolean; italics?: boolean }[] = [];
+  const pattern = /\*\*(.+?)\*\*|\*(.+?)\*/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) runs.push({ text: text.slice(lastIndex, match.index) });
+    if (match[1] !== undefined) runs.push({ text: match[1], bold: true });
+    else if (match[2] !== undefined) runs.push({ text: match[2], italics: true });
+    lastIndex = pattern.lastIndex;
+  }
+  if (lastIndex < text.length) runs.push({ text: text.slice(lastIndex) });
+  return runs.length > 0 ? runs : [{ text }];
 }
 
 /** Renders the SIGN2NOTES-styled plain-text document (see workplan section 7). */
@@ -190,4 +213,78 @@ export function slugify(title: string, fallback = "sign2notes"): string {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/(^-|-$)/g, "");
   return slug || fallback;
+}
+
+/** Builds the `docx` Document object for a set of notes -- separated out
+ * from downloadDocx() so tests can construct it directly and inspect the
+ * output (via Packer.toBuffer(), etc.) without needing to also exercise
+ * the browser download plumbing (URL.createObjectURL / anchor click),
+ * which is identical boilerplate to downloadPdf()/downloadTextFile() and
+ * doesn't need re-testing here. */
+export async function buildDocxDocument(markdown: string, meta: ExportMeta = {}) {
+  const { Document, Paragraph, TextRun, HeadingLevel } = await import("docx");
+
+  const duration = formatDuration(meta.durationSeconds);
+  const children: InstanceType<typeof Paragraph>[] = [
+    new Paragraph({ text: meta.title || "Lecture Notes", heading: HeadingLevel.TITLE }),
+    new Paragraph({
+      children: [
+        new TextRun({
+          text: `Date: ${formatDate(meta.date)}${duration ? `    Duration: ${duration}` : ""}`,
+          italics: true,
+          color: "666666",
+        }),
+      ],
+    }),
+    new Paragraph({ text: "" }),
+  ];
+
+  for (const line of parseNoteLines(markdown, /* stripEmphasis */ false)) {
+    if (line.kind === "blank") {
+      children.push(new Paragraph({ text: "" }));
+      continue;
+    }
+    if (line.kind === "heading") {
+      children.push(
+        new Paragraph({
+          children: parseInlineRuns(line.text).map((r) => new TextRun(r)),
+          heading: HeadingLevel.HEADING_2,
+        })
+      );
+      continue;
+    }
+    children.push(
+      new Paragraph({
+        children: parseInlineRuns(line.text).map((r) => new TextRun(r)),
+        bullet: line.kind === "bullet" ? { level: 0 } : undefined,
+      })
+    );
+  }
+
+  return new Document({ sections: [{ children }] });
+}
+
+/**
+ * Renders notes to a simple .docx file via the `docx` library, entirely
+ * client-side (dynamically imported, same reasoning as jsPDF above --
+ * only loads for users who actually export to Word). Deliberately a
+ * SIMPLE document, not an elaborate report template: a title, a date/
+ * duration line, and the notes themselves as headings/bullets/paragraphs
+ * with bold and italic markup preserved as real Word formatting (not
+ * stripped, unlike the plain-text/PDF renderers) -- nothing about
+ * confidence scores, model versions, or other internal state, since the
+ * user didn't ask for that to be in their exported document.
+ */
+export async function downloadDocx(filename: string, markdown: string, meta: ExportMeta = {}) {
+  const { Packer } = await import("docx");
+  const doc = await buildDocxDocument(markdown, meta);
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }

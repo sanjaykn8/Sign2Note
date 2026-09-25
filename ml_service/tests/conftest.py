@@ -9,6 +9,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import feature_schema as fs
+
 
 @pytest.fixture
 def tmp_feature_dir(tmp_path):
@@ -34,7 +36,7 @@ def synthetic_index_and_features(tmp_path):
     for label_idx, label in enumerate(labels):
         for i in range(4):
             vid = f"{label.lower()}_{i}"
-            arr = rng.random((20, 126)).astype(np.float32) + label_idx * 2
+            arr = rng.random((20, fs.FEATURE_DIM)).astype(np.float32) + label_idx * 2
             np.save(feature_dir / f"{vid}.npy", arr)
             rows.append({"video_id": vid, "label": label, "split": "train"})
 

@@ -66,18 +66,18 @@ it's two different trust boundaries for two different input sources.
 
 | Component | File(s) | Responsibility |
 |---|---|---|
-| React frontend | `frontend/src/pages/Index.tsx`, `Webcam.tsx` | Upload UI, live webcam UI, results/notes display |
+| React frontend | `frontend/src/pages/Index.tsx`, `Webcam.tsx`, `LiveTranscription.tsx` | Upload UI, live webcam UI, live transcription UI, results/notes display |
 | Node gateway | `backend/server.js` | Holds uploads in memory, proxies to FastAPI, never touches raw video on disk |
-| FastAPI ML service | `ml_service/api.py` | HTTP API: `/process` (video), `/notes` (gloss→notes), `/model/meta`, `/model/onnx`, `/health` |
-| Feature extraction | `ml_service/feature_extraction.py` | Video → per-frame MediaPipe hand keypoints (126-dim vectors), batch (training) and single-video (inference) paths |
-| Dataset | `ml_service/dataset.py` | Loads `data/index.csv` + `.npy` features into training samples, with augmentation |
-| Model | `ml_service/model.py` | `TemporalCNN` — the lightweight recognition model |
+| FastAPI ML service | `ml_service/api.py` | HTTP API: `/process` (video), `/notes` (gloss→notes), `/transcript` (gloss→natural-language transcript), `/recognize` (keypoints→glosses, no notes), `/model/meta`, `/model/onnx`, `/health` |
+| Feature extraction | `ml_service/feature_extraction.py`, `feature_schema.py` | Video → per-frame MediaPipe **Holistic** (hand+body+face) keypoints, canonical 285-dim vectors — see `FEATURE_SCHEMA.md`. Batch (training) and single-video (inference) paths. |
+| Dataset | `ml_service/dataset.py` | Loads `data/index.csv` + `.npy` (schema v2) features into training samples, with augmentation |
+| Model | `ml_service/model.py` | `TemporalCNN` — the lightweight recognition model (default architecture; see `--architecture` in `train.py` for the optional CNN+BiLSTM experiment) |
 | Training | `ml_service/train.py` | Trains the model, exports `.pt` checkpoint + ONNX |
 | Inference | `ml_service/infer.py` | Sliding-window inference, LLM-backed and template note generation |
 | Smoothing | `ml_service/inference_viterbi.py` | Viterbi decoding: `viterbi_decode()` (flat label list) and `viterbi_events()` (timestamped events) |
-| Notes | `ml_service/notes_generator.py` | Deterministic template engine + LLM prompt construction |
-| Client-side pipeline | `frontend/src/lib/webcamPipeline.ts` | Pure logic: keypoint construction, normalization, buffering, real-time smoothing (unit-tested) |
-| Client-side ML | `frontend/src/lib/onnxSession.ts`, `handLandmarker.ts` | Browser wrappers around onnxruntime-web and MediaPipe Tasks Vision |
+| Notes | `ml_service/notes_generator.py` | Deterministic template engine (style-aware) + LLM prompt construction, in three genuinely different styles (concise/detailed/academic) |
+| Client-side pipeline | `frontend/src/lib/webcamPipeline.ts`, `featureSchema.ts` | Pure logic: keypoint construction (mirrors `feature_schema.py` exactly, cross-checked by a golden-vector test), normalization, buffering, real-time smoothing (unit-tested) |
+| Client-side ML | `frontend/src/lib/onnxSession.ts`, `holisticLandmarker.ts` | Browser wrappers around onnxruntime-web and MediaPipe Tasks Vision's HolisticLandmarker |
 
 ## Long-video support
 
@@ -92,7 +92,8 @@ Video
 Keypoint extraction (frame-by-frame, streamed via cv2.VideoCapture —
    never loads the whole video into memory; a several-minute clip's
    extracted keypoint sequence is a few hundred KB at most, since it's
-   126 floats per kept frame, not raw pixels)
+   285 floats per kept frame — hand+body+face, schema v2, see
+   FEATURE_SCHEMA.md — not raw pixels)
  ↓
 Sliding temporal windows (ml_service/infer.py: _window_batch)
    — each window is independently normalized (same as a training sample),
@@ -145,21 +146,27 @@ the code comment on `_window_batch` in `infer.py`.
 ```text
 Browser webcam (getUserMedia)
  ↓
-MediaPipe HandLandmarker (WASM, in-browser)
-   — sampled roughly every 280ms, approximating the training-time
-     frame_skip=8 @ ~25-30fps cadence (browsers don't give the same exact
-     frame-count control that offline video decoding does)
+MediaPipe HolisticLandmarker (WASM, in-browser) -- one model, one pass,
+   gives hand+pose+face landmarks together (see FEATURE_SCHEMA.md
+   "Detector") — sampled roughly every 280ms, approximating the
+   training-time frame_skip=8 @ ~25-30fps cadence (browsers don't give the
+   same exact frame-count control that offline video decoding does)
  ↓
-keypointsFromLandmarks() — mirrors feature_extraction.py's
-   _extract_keypoints() exactly: first detected hand → first 63 values,
-   second detected hand → next 63, zero-padded if fewer than 2 hands.
-   Cross-validated numerically against the Python implementation.
+buildFeatureVector() (featureSchema.ts) — mirrors feature_schema.py's
+   build_feature_vector() exactly: canonical LEFT_HAND → RIGHT_HAND →
+   POSE → FACE layout, 285 dims. Left/right hand identity comes directly
+   from HolisticLandmarker (leftHandLandmarks/rightHandLandmarks), not
+   detection order. Cross-validated numerically against the Python
+   implementation via a golden-vector fixture (see
+   featureSchema.crosscheck.test.ts).
  ↓
 KeypointBuffer (sliding window, ring buffer, zero-pads at the end when
-   not yet full — mirrors infer.py's _pad_window())
+   not yet full — mirrors feature_schema.py's pad_or_trim())
  ↓
-normalizeWindow() — mirrors infer.py's _normalize() exactly (verified to
-   match Python's output to 5-6 decimal places on identical input)
+normalizeSequence() (featureSchema.ts) — mirrors feature_schema.py's
+   normalize_sequence() exactly, including excluding pose-visibility dims
+   from z-scoring (verified to match Python's output to 3-4 decimal
+   places on identical input)
  ↓
 onnxruntime-web inference (WASM, in-browser) — same ONNX model file the
    backend serves, fetched once via GET /model/onnx
@@ -225,10 +232,59 @@ explicitly: they're deliberately different, for different UX goals.
   delete, or undo any committed event afterward, so a misread sign isn't
   permanent even after it's been added.
 
+## Live Transcription (Mode 3)
+
+`frontend/src/pages/Webcam.tsx` (Mode 2) and
+`frontend/src/pages/LiveTranscription.tsx` (Mode 3) share the exact same
+recognition pipeline -- model/camera loading, the Holistic detection
+loop, `SessionSmoother`, session history editing -- via one hook,
+`frontend/src/lib/useSignRecognitionSession.ts`. Live Transcription adds:
+
+- **A screen/tab capture source**, alongside the webcam, via the
+  browser's native `getDisplayMedia()` -- for transcribing sign-language
+  content already playing on the device rather than signing directly at
+  the camera (project brief section 22, "watching sign-language content
+  on a laptop/mobile/system screen"). This is genuinely what the browser
+  supports (the user picks a tab, a window, or their screen in the
+  browser's own dialog) -- there's no way for a web page to force true
+  OS-wide capture, and this doesn't pretend to (RULE 19).
+- **A Stop & Generate flow that calls the LLM exactly once**, not per
+  sign and not continuously (project brief section 21 / RULE 9):
+
+  ```text
+  ACTIVE: recognize -> stability filter -> append gloss -> update live transcript
+      (SessionSmoother; the LLM is never touched here)
+   ↓ user clicks "Stop & Generate"
+  STOPPING: stop the camera/detection loop, freeze the gloss sequence
+   ↓ (if the frozen sequence is empty, stop here with an error -- nothing to generate)
+  GENERATING: POST /transcript AND POST /notes in parallel, with the SAME
+      frozen gloss list
+   ↓
+  COMPLETED: show the natural-language transcript (Layer 2) and the
+      structured notes (Layer 3) together
+  ```
+
+  A `genPhase` state (`idle` / `stopping` / `generating` / `completed` /
+  `error`) guards this specifically against a rapid double-click firing
+  two generation requests -- the one place in the whole UI where a
+  duplicate request would actually cost something (two LLM calls
+  instead of one). Covered by a real rendered-component test,
+  `frontend/src/pages/__tests__/LiveTranscription.test.tsx`, including a
+  simulated double-click and an LLM-failure + retry-with-preserved-
+  glosses scenario (project brief section 31: don't lose the session on
+  a network failure).
+- **A separate `/transcript` endpoint**, not a `style` value on `/notes`:
+  a transcript (flowing prose, in gloss order) and structured notes
+  (headed/bulleted, reorganized by topic) are genuinely different outputs
+  built from different prompts -- see `notes_generator.py`'s module
+  docstring on the "three output layers" (recognition -> transcript ->
+  notes). `/transcript` has no `style` field; a transcript's job doesn't
+  change with register the way notes do.
+
 ## Model requirements
 
 The recognition model (`ml_service/model.py: TemporalCNN`) is intentionally
-a lightweight 1D-convolutional temporal classifier, not a Transformer —
+a lightweight 1D-convolutional temporal classifier, not a Transformer --
 sized to run comfortably on a 6GB laptop GPU (RTX 4050) and, for the
 webcam demo, to run in a browser via WASM without a GPU at all. See
 `SETUP.md` for training/hardware recommendations.

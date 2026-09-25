@@ -1,5 +1,5 @@
 import { NavLink } from "@/components/NavLink";
-import { Upload, Video } from "lucide-react";
+import { Upload, Video, MessageSquareText } from "lucide-react";
 
 export default function AppNav() {
   const linkClass =
@@ -18,6 +18,10 @@ export default function AppNav() {
           <NavLink to="/webcam" className={linkClass} activeClassName={activeClass}>
             <Video className="h-4 w-4" />
             Live Webcam
+          </NavLink>
+          <NavLink to="/live-transcription" className={linkClass} activeClassName={activeClass}>
+            <MessageSquareText className="h-4 w-4" />
+            Live Transcription
           </NavLink>
         </div>
       </div>
