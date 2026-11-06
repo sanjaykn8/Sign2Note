@@ -18,11 +18,33 @@ class SignDataset(Dataset):
         max_len: int = 50,
         labels_json: Optional[str] = None,
         augment: bool = False,
+        label2id: Optional[dict] = None,
+        expected_dim: Optional[int] = None,
+        preload: bool = False,
+        verbose: bool = True,
+        feature_columns=None,
     ):
+        """`label2id` (if given) takes precedence over `labels_json` --
+        evaluate.py passes the CHECKPOINT's own mapping so evaluation can't
+        silently use a different vocabulary than the model was trained on.
+        `expected_dim` defaults to the current schema (285); pass 126 to
+        evaluate the legacy v1 model on v1 features. `preload` loads every
+        feature file into memory once (much faster CPU training).
+
+        After construction, `self.df` holds exactly the rows this dataset
+        serves, in order -- callers must take split membership from
+        `self.df["split"]` (see split_utils.*_from_df), never from a fresh
+        read of index_csv, whose row numbers no longer line up once rows
+        without features / outside the vocabulary are dropped."""
         self.df = pd.read_csv(index_csv)
         self.feature_dir = Path(feature_dir)
         self.max_len = max_len
         self.augment = augment
+        self.expected_dim = expected_dim
+        # Optional column subset applied AFTER the dim check (ablation
+        # experiments, e.g. hands-only slices of schema-v2 features).
+        self.feature_columns = None if feature_columns is None else np.asarray(feature_columns)
+        n_index_rows = len(self.df)
 
         # ---------------------------------------------------------
         # Keep only samples for which features actually exist
@@ -47,7 +69,10 @@ class SignDataset(Dataset):
         # Vocabulary
         # ---------------------------------------------------------
 
-        if labels_json and Path(labels_json).exists():
+        if label2id is not None:
+            self.label2id = dict(label2id)
+
+        elif labels_json and Path(labels_json).exists():
             payload = json.loads(
                 Path(labels_json).read_text(
                     encoding="utf-8"
@@ -84,8 +109,15 @@ class SignDataset(Dataset):
             for label, i in self.label2id.items()
         }
 
-        print(f"Dataset size: {len(self.df)}")
-        print(f"Classes: {len(self.label2id)}")
+        self.num_dropped_rows = n_index_rows - len(self.df)
+        if verbose:
+            print(f"Dataset size: {len(self.df)} (dropped {self.num_dropped_rows} index rows "
+                  f"without features or outside the vocabulary)")
+            print(f"Classes: {len(self.label2id)}")
+
+        self._cache = None
+        if preload:
+            self._cache = [self._load(i) for i in range(len(self.df))]
 
     def __len__(self):
         return len(self.df)
@@ -205,43 +237,19 @@ class SignDataset(Dataset):
             return x
 
         T, D = x.shape
+        if T < 2:
+            return x
 
-        speed = np.random.uniform(
-            0.80,
-            1.20
-        )
+        speed = np.random.uniform(0.80, 1.20)
+        new_T = max(2, int(T / speed))
 
-        new_T = max(
-            2,
-            int(T / speed)
-        )
-
-        old_positions = np.linspace(
-            0,
-            T - 1,
-            T
-        )
-
-        new_positions = np.linspace(
-            0,
-            T - 1,
-            new_T
-        )
-
-        result = np.empty(
-            (new_T, D),
-            dtype=np.float32
-        )
-
-        for d in range(D):
-
-            result[:, d] = np.interp(
-                new_positions,
-                old_positions,
-                x[:, d]
-            )
-
-        return result
+        # Vectorized linear interpolation over time (same result as one
+        # np.interp per dimension, without the per-dimension Python loop).
+        pos = np.linspace(0, T - 1, new_T)
+        lo = np.floor(pos).astype(int)
+        hi = np.minimum(lo + 1, T - 1)
+        w = (pos - lo)[:, None].astype(np.float32)
+        return (x[lo] * (1.0 - w) + x[hi] * w).astype(np.float32)
 
     # =============================================================
     # Random temporal crop
@@ -305,19 +313,21 @@ class SignDataset(Dataset):
     # Main sample loader
     # =============================================================
 
+    def _load(self, idx):
+        row = self.df.iloc[idx]
+        feature_path = self.feature_dir / f"{row['video_id']}.npy"
+        x = np.load(feature_path).astype(np.float32)
+        fs.assert_feature_dim(x.shape[-1], context=str(feature_path),
+                              expected_dim=self.expected_dim)
+        if self.feature_columns is not None:
+            x = np.ascontiguousarray(x[:, self.feature_columns])
+        return x
+
     def __getitem__(self, idx):
 
         row = self.df.iloc[idx]
 
-        feature_path = (
-            self.feature_dir
-            / f"{row['video_id']}.npy"
-        )
-
-        x = np.load(feature_path).astype(
-            np.float32
-        )
-        fs.assert_feature_dim(x.shape[-1], context=str(feature_path))
+        x = self._cache[idx] if self._cache is not None else self._load(idx)
 
         # ---------------------------------------------------------
         # IMPORTANT:

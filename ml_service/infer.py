@@ -17,11 +17,13 @@ import numpy as np
 import torch
 
 import feature_schema as fs
+from checkpoint_meta import compute_vocab_hash
 from inference_viterbi import viterbi_decode, viterbi_events
 from model import build_model
 from notes_generator import (
     build_notes_prompt, template_notes_from_tokens,
     build_transcript_prompt, template_transcript_from_tokens,
+    PROMPT_VERSIONS, TRANSCRIPT_PROMPT_VERSION,
 )
 
 try:
@@ -56,6 +58,13 @@ LLM_BASE_URL  = os.environ.get(
     "http://127.0.0.1:11434/v1" if LLM_PROVIDER == "ollama" else "http://127.0.0.1:8081/v1",
 )
 
+# Bounded LLM calls: the OpenAI client's defaults (10-minute timeout, 2
+# automatic retries) meant a hung local server could block a notes request
+# for ~30 minutes before the deterministic fallback kicked in.
+LLM_TIMEOUT_SECONDS = float(os.environ.get("LLM_TIMEOUT", 90))
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", 1))
+LLM_MAX_OUTPUT_CHARS = int(os.environ.get("LLM_MAX_OUTPUT_CHARS", 20000))
+
 _llm_client = None
 
 
@@ -66,8 +75,34 @@ def _get_llm_client():
     global _llm_client
     if _llm_client is None:
         from openai import OpenAI
-        _llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="not-needed")
+        _llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="not-needed",
+                             timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
     return _llm_client
+
+
+class LLMOutputError(RuntimeError):
+    """The LLM answered, but with something unusable as notes."""
+
+
+def clean_llm_output(text: str, require_markdown_heading: bool = False) -> str:
+    """Validate/clean raw LLM output before it is shown to a user:
+    strips reasoning blocks some local models emit (<think>...</think>) and
+    a wrapping ```markdown fence, rejects empty/oversized output, and (for
+    notes) requires at least one Markdown heading or bullet so plain chatter
+    like "Sure! Here are your notes" isn't presented as notes."""
+    import re
+    t = (text or "").strip()
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
+    fence = re.match(r"^```[a-zA-Z]*\s*\n(.*?)\n```\s*$", t, flags=re.DOTALL)
+    if fence:
+        t = fence.group(1).strip()
+    if not t:
+        raise LLMOutputError("LLM server returned an empty response")
+    if len(t) > LLM_MAX_OUTPUT_CHARS:
+        raise LLMOutputError(f"LLM output too long ({len(t)} chars)")
+    if require_markdown_heading and not re.search(r"^\s*(#{1,6}\s|[-*]\s|\d+\.\s)", t, flags=re.MULTILINE):
+        raise LLMOutputError("LLM output has no Markdown structure (no heading or list)")
+    return t
 
 
 _torch_cache = None
@@ -87,35 +122,90 @@ def _pad_window(x, max_len):
     return fs.pad_or_trim(x, max_len)
 
 
+def _file_key(path) -> str:
+    """Cache key for a model file: resolved path + mtime, so replacing a
+    checkpoint on disk (retraining) is picked up without a restart."""
+    p = Path(path).resolve()
+    try:
+        return f"{p}@{p.stat().st_mtime_ns}"
+    except OSError:
+        return str(p)
+
+
+def _cache_get(cache, key):
+    # Tests reset the caches by assigning None; treat that as empty.
+    return cache.get(key) if isinstance(cache, dict) else None
+
+
+def _read_checkpoint(checkpoint, map_location="cpu"):
+    # weights_only=False: our checkpoints are plain dicts written by
+    # train.py (trusted, local files) that include metadata alongside the
+    # state_dict. Never point MODEL_PATH at a checkpoint from an untrusted
+    # source -- torch.load unpickles it.
+    try:
+        return torch.load(checkpoint, map_location=map_location, weights_only=False)
+    except TypeError:  # very old torch without weights_only
+        return torch.load(checkpoint, map_location=map_location)
+
+
 def _load_torch(checkpoint):
+    """Load (and cache, PER CHECKPOINT PATH) a torch model. The cache used
+    to be a single global slot, so loading a second checkpoint (e.g. the
+    legacy v1 model for comparison) silently returned the first one."""
     global _torch_cache
-    if _torch_cache is not None:
-        return _torch_cache
-    ckpt = torch.load(checkpoint, map_location=DEVICE)
+    key = _file_key(checkpoint)
+    cached = _cache_get(_torch_cache, key)
+    if cached is not None:
+        return cached
+    ckpt = _read_checkpoint(checkpoint, map_location=DEVICE)
     architecture = ckpt.get("architecture", "temporal_cnn")
     model = build_model(architecture, int(ckpt["input_dim"]), len(ckpt["label2id"]))
     model.load_state_dict(ckpt["model"])
     model.to(DEVICE).eval()
     id2label = {int(i): label for label, i in ckpt["label2id"].items()}
-    _torch_cache = (model, id2label, int(ckpt["max_len"]))
-    return _torch_cache
+    entry = (model, id2label, int(ckpt["max_len"]))
+    if not isinstance(_torch_cache, dict):
+        _torch_cache = {}
+    _torch_cache[key] = entry
+    return entry
 
 
 def _load_onnx(onnx_path, checkpoint=None):
+    """Load (and cache, per ONNX+checkpoint pair) an onnxruntime session.
+    The checkpoint supplies the label mapping and max_len; the ONNX graph's
+    declared input dim is checked against the checkpoint's input_dim so a
+    stale/mismatched export can't be paired with the wrong vocabulary."""
     global _onnx_cache
-    if _onnx_cache is not None:
-        return _onnx_cache
     if ort is None:
         raise RuntimeError("onnxruntime is not installed")
     if checkpoint is None:
         checkpoint = DEFAULT_CHECKPOINT
-    ckpt = torch.load(checkpoint, map_location="cpu")
+    key = f"{_file_key(onnx_path)}|{_file_key(checkpoint)}"
+    cached = _cache_get(_onnx_cache, key)
+    if cached is not None:
+        return cached
+    ckpt = _read_checkpoint(checkpoint, map_location="cpu")
     id2label = {int(i): label for label, i in ckpt["label2id"].items()}
     max_len = int(ckpt["max_len"])
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in ort.get_available_providers() else ["CPUExecutionProvider"]
     session = ort.InferenceSession(str(onnx_path), providers=providers)
-    _onnx_cache = (session, id2label, max_len, providers)
-    return _onnx_cache
+    onnx_dim = session.get_inputs()[0].shape[-1]
+    if isinstance(onnx_dim, int) and onnx_dim != int(ckpt["input_dim"]):
+        raise fs.FeatureSchemaError(
+            f"ONNX model {onnx_path} expects {onnx_dim}-dim input but checkpoint {checkpoint} "
+            f"says input_dim={ckpt['input_dim']} -- they are not the same model."
+        )
+    onnx_classes = session.get_outputs()[0].shape[-1]
+    if isinstance(onnx_classes, int) and onnx_classes != len(id2label):
+        raise fs.FeatureSchemaError(
+            f"ONNX model {onnx_path} outputs {onnx_classes} classes but checkpoint {checkpoint} "
+            f"has {len(id2label)} labels -- they are not the same model."
+        )
+    entry = (session, id2label, max_len, providers)
+    if not isinstance(_onnx_cache, dict):
+        _onnx_cache = {}
+    _onnx_cache[key] = entry
+    return entry
 
 
 def get_model_meta(checkpoint_path=None):
@@ -131,50 +221,65 @@ def get_model_meta(checkpoint_path=None):
     v1-era values for older checkpoints saved before those fields existed
     (RULE 67: backward compatible, not a breaking change)."""
     checkpoint = Path(checkpoint_path or DEFAULT_CHECKPOINT)
-    ckpt = torch.load(checkpoint, map_location="cpu")
+    ckpt = _read_checkpoint(checkpoint, map_location="cpu")
     id2label = {int(i): label for label, i in ckpt["label2id"].items()}
+    schema = str(ckpt.get("feature_schema_version", fs.LEGACY_SCHEMA_VERSION))
     return {
         "max_len": int(ckpt["max_len"]),
         "input_dim": int(ckpt["input_dim"]),
         "num_classes": len(id2label),
         "label2id": {v: k for k, v in id2label.items()},
         "id2label": id2label,
-        "feature_schema_version": ckpt.get("feature_schema_version", "1.0"),
+        "feature_schema_version": schema,
+        "feature_type": fs.SCHEMA_TYPES.get(schema, "unknown"),
+        "is_legacy_schema": schema == fs.LEGACY_SCHEMA_VERSION,
         "architecture": ckpt.get("architecture", "temporal_cnn"),
-        "vocab_hash": ckpt.get("vocab_hash"),
+        "vocab_hash": ckpt.get("vocab_hash") or compute_vocab_hash(ckpt["label2id"]),
         "best_val_accuracy": ckpt.get("best_val_accuracy"),
+        "used_official_split": (ckpt.get("training_config") or {}).get("used_official_split"),
+        "test_metrics": ckpt.get("test_metrics"),
         "trained_at": ckpt.get("trained_at"),
+        "model_version": ckpt.get("model_version") or checkpoint.parent.parent.name,
     }
 
 
-def _window_batch(features, max_len, stride=12):
-    """Slice a (T, D) raw keypoint sequence into overlapping (max_len, D)
-    windows, normalizing EACH WINDOW INDEPENDENTLY via
-    feature_schema.prepare_window() (pad/trim-then-normalize, in that
-    order) -- this must exactly match dataset.py's SignDataset, which
-    pads/trims each training sample to max_len and THEN computes that
-    sample's own per-clip mean/std (both now call the same shared
-    function; see feature_schema.py / FEATURE_SCHEMA.md "Normalization").
-    Normalizing the whole long sequence once before slicing (the original,
-    pre-sliding-window behavior) would compute one global mean/std across
-    the entire clip, which drifts further from what the model was trained
-    on the longer the video is and the more the signing scale/position
-    varies over time -- exactly the failure mode long videos need to
-    handle well. Also returns each window's (start_frame, end_frame) span
-    in *extracted-frame* units for timestamps."""
-    x = np.asarray(features, dtype=np.float32)
-    if len(x) <= max_len:
-        return fs.prepare_window(x, max_len)[None, ...], [(0, len(x))]
+_meta_cache = {}
 
-    windows = []
-    spans = []
-    for start in range(0, len(x) - max_len + 1, stride):
-        windows.append(fs.prepare_window(x[start:start + max_len], max_len))
-        spans.append((start, start + max_len))
-    if (len(x) - max_len) % stride:
-        start = len(x) - max_len
-        windows.append(fs.prepare_window(x[start:], max_len))
-        spans.append((start, len(x)))
+
+def model_input_dim(checkpoint_path) -> int:
+    """input_dim recorded in a checkpoint (cached per path)."""
+    key = _file_key(checkpoint_path)
+    if key not in _meta_cache:
+        ckpt = _read_checkpoint(checkpoint_path, map_location="cpu")
+        _meta_cache[key] = int(ckpt["input_dim"])
+    return _meta_cache[key]
+
+
+def _window_spans(n_frames, window, stride):
+    """(start, end) spans of overlapping windows of `window` real frames
+    covering n_frames, the last one aligned to the end of the sequence."""
+    if n_frames <= window:
+        return [(0, n_frames)]
+    spans = [(s, s + window) for s in range(0, n_frames - window + 1, stride)]
+    if (n_frames - window) % stride:
+        spans.append((n_frames - window, n_frames))
+    return spans
+
+
+def _window_batch(features, max_len, stride=12, window_frames=None):
+    """Slice a (T, D) raw keypoint sequence into overlapping windows of
+    `window_frames` real frames (default: max_len), each padded to max_len
+    and normalized INDEPENDENTLY via feature_schema.prepare_window()
+    (pad-then-normalize -- exactly what dataset.py does to each training
+    clip). Training clips are ~20-35 sampled frames zero-padded to
+    max_len, so windows shorter than max_len (api.py's WINDOW_FRAMES)
+    reproduce the training distribution on continuous video. Returns the
+    windows and each window's (start_frame, end_frame) span in
+    extracted-frame units for timestamps."""
+    x = np.asarray(features, dtype=np.float32)
+    window = max_len if not window_frames else max(1, min(int(window_frames), max_len))
+    spans = _window_spans(len(x), window, max(1, int(stride)))
+    windows = [fs.prepare_window(x[a:b], max_len) for a, b in spans]
     return np.stack(windows).astype(np.float32), spans
 
 
@@ -196,32 +301,53 @@ def _run_windows_chunked(batch, session=None, model=None):
     return np.concatenate(outs, axis=0)
 
 
+def _run_windows_streaming(x, max_len, stride, window_frames, session=None, model=None):
+    """Like _window_batch + _run_windows_chunked, but builds the padded
+    windows one INFER_CHUNK_SIZE chunk at a time, so peak memory does not
+    grow with video length (a 30-minute video at stride 4 is ~3400
+    windows = ~250 MB if all materialized at once)."""
+    window = max_len if not window_frames else max(1, min(int(window_frames), max_len))
+    spans = _window_spans(len(x), window, max(1, int(stride)))
+    outs = []
+    for start in range(0, len(spans), INFER_CHUNK_SIZE):
+        chunk_spans = spans[start:start + INFER_CHUNK_SIZE]
+        chunk = np.stack([fs.prepare_window(x[a:b], max_len) for a, b in chunk_spans]).astype(np.float32)
+        outs.append(_run_windows_chunked(chunk, session=session, model=model))
+    return np.concatenate(outs, axis=0), spans
+
+
 def predict_from_array(features, checkpoint_path=None, onnx_path=None,
-                       stride=12, threshold=0.55, fps=None, frame_skip=8):
-    """Same pipeline as predict_from_features(), but takes an in-memory
-    (T, FEATURE_DIM) array directly instead of a .npy path on disk -- used
-    by api.py's /recognize endpoint for clients that send already-
-    extracted keypoints (RULE 8/section 23: prefer sending keypoints over
-    raw video when the client can extract them locally, since keypoints
-    never need to touch a temp file server-side at all this way).
-    predict_from_features() is now a thin wrapper around this."""
+                       stride=12, threshold=0.55, fps=None, frame_skip=8, window_frames=None):
+    """Sliding-window recognition over an in-memory (T, input_dim) keypoint
+    array (used directly by /recognize; predict_from_features() wraps it).
+    `window_frames` = real frames per window (default: max_len, the
+    original behavior); see _window_batch for why shorter windows padded
+    to max_len match training better on continuous video."""
     features = np.asarray(features, dtype=np.float32)
     if len(features) == 0:
         return {"gloss_list": [], "segments": [], "events": [], "top_confidence": 0.0,
                 "backend": "none", "providers": []}
-    fs.assert_feature_dim(features.shape[-1], context="in-memory features")
+    if features.ndim != 2 or not np.all(np.isfinite(features)):
+        raise fs.FeatureSchemaError(
+            "features must be a finite (num_frames, feature_dim) array"
+        )
 
     checkpoint = Path(checkpoint_path or DEFAULT_CHECKPOINT)
+    # Validate against the schema of the MODEL being served (126 for the
+    # legacy v1 model, 285 for v2) -- never silently feed one schema's
+    # vectors to a model trained on the other.
+    fs.assert_feature_dim(
+        features.shape[-1], context="in-memory features",
+        expected_dim=model_input_dim(checkpoint),
+    )
     onnx_file = Path(onnx_path or DEFAULT_ONNX)
     use_onnx = onnx_file.exists() and ort is not None
     if use_onnx:
         session, id2label, max_len, providers = _load_onnx(onnx_file, checkpoint)
-        batch, spans = _window_batch(features, max_len, stride)
-        logits = _run_windows_chunked(batch, session=session)
+        logits, spans = _run_windows_streaming(features, max_len, stride, window_frames, session=session)
     else:
         model, id2label, max_len = _load_torch(checkpoint)
-        batch, spans = _window_batch(features, max_len, stride)
-        logits = _run_windows_chunked(batch, model=model)
+        logits, spans = _run_windows_streaming(features, max_len, stride, window_frames, model=model)
         providers = [DEVICE]
 
     logits = logits - logits.max(axis=1, keepdims=True)
@@ -233,8 +359,10 @@ def predict_from_array(features, checkpoint_path=None, onnx_path=None,
     segments = []
     window_times = []
     for i, (p, (fstart, fend)) in enumerate(zip(probs, spans)):
-        j = int(p.argmax())
-        seg = {"window": i, "label": id2label[j], "confidence": float(p[j])}
+        top3 = np.argsort(-p)[:3]
+        j = int(top3[0])
+        seg = {"window": i, "label": id2label[j], "confidence": float(p[j]),
+               "alternatives": [{"label": id2label[int(k)], "confidence": float(p[k])} for k in top3[1:]]}
         if fps:
             t0 = (fstart * frame_skip) / fps
             t1 = (fend * frame_skip) / fps
@@ -258,7 +386,7 @@ def predict_from_array(features, checkpoint_path=None, onnx_path=None,
 
 
 def predict_from_features(feature_path, checkpoint_path=None, onnx_path=None,
-                          stride=12, threshold=0.55, fps=None, frame_skip=8):
+                          stride=12, threshold=0.55, fps=None, frame_skip=8, window_frames=None):
     """Run the sliding-window pipeline over one clip's extracted keypoints,
     loaded from a .npy file on disk. Thin wrapper around
     predict_from_array() -- see that function for the actual pipeline.
@@ -275,43 +403,46 @@ def predict_from_features(feature_path, checkpoint_path=None, onnx_path=None,
     if len(features) == 0:
         return {"gloss_list": [], "segments": [], "events": [], "top_confidence": 0.0,
                 "backend": "none", "providers": []}
-    fs.assert_feature_dim(features.shape[-1], context=str(feature_path))
+    fs.assert_feature_dim(
+        features.shape[-1], context=str(feature_path),
+        expected_dim=model_input_dim(checkpoint_path or DEFAULT_CHECKPOINT),
+    )
     return predict_from_array(
         features, checkpoint_path=checkpoint_path, onnx_path=onnx_path,
         stride=stride, threshold=threshold, fps=fps, frame_skip=frame_skip,
+        window_frames=window_frames,
     )
 
 
-def generate_llm_notes(gloss_list, model=None, style="concise", base_url=None):
-    if not gloss_list:
-        raise ValueError("gloss_list is empty")
-
-    global _llm_client
+def _llm_client_for(base_url=None):
     if base_url and base_url != LLM_BASE_URL:
         from openai import OpenAI
-        client = OpenAI(base_url=base_url, api_key="not-needed")
-    else:
-        client = _get_llm_client()
+        return OpenAI(base_url=base_url, api_key="not-needed",
+                      timeout=LLM_TIMEOUT_SECONDS, max_retries=LLM_MAX_RETRIES)
+    return _get_llm_client()
 
-    prompt = build_notes_prompt(gloss_list, style=style)
-    
-    # Combine system instruction into the user prompt to avoid template parsing bugs in llama.cpp
-    full_content = (
-        "You are an AI assistant that converts sign-language gloss sequences into clear written notes.\n\n"
-        f"{prompt}"
-    )
 
+def _chat(prompt, preamble, model=None, base_url=None):
+    client = _llm_client_for(base_url)
+    # System instruction is folded into the user turn to avoid chat-template
+    # parsing bugs seen with some llama.cpp builds.
     response = client.chat.completions.create(
         model=model or LLM_MODEL,
-        messages=[
-            {"role": "user", "content": full_content},
-        ],
+        messages=[{"role": "user", "content": preamble + "\n\n" + prompt}],
         temperature=0.2,
     )
-    text = (response.choices[0].message.content or "").strip()
-    if not text:
-        raise RuntimeError("LLM server returned an empty response")
-    return text
+    return response.choices[0].message.content or ""
+
+
+def generate_llm_notes(gloss_list, model=None, style="concise", base_url=None,
+                       confidences=None, context=None):
+    if not gloss_list:
+        raise ValueError("gloss_list is empty")
+    prompt = build_notes_prompt(gloss_list, style=style, confidences=confidences, context=context)
+    raw = _chat(prompt, "You are an assistant that converts sign-language gloss sequences into "
+                        "clear written notes, strictly grounded in the glosses provided.",
+                model=model, base_url=base_url)
+    return clean_llm_output(raw, require_markdown_heading=True)
 
 
 # Kept as an alias: earlier versions of this project called this function
@@ -319,9 +450,39 @@ def generate_llm_notes(gloss_list, model=None, style="concise", base_url=None):
 # both providers via LLM_PROVIDER/LLM_BASE_URL.
 generate_llama_cpp_notes = generate_llm_notes
 
+_LLM_MODES = ("llm", "llama_cpp", "ollama")
+
+
+def generate_notes_with_meta(gloss_list, mode="template", llm_model=None, style="concise",
+                             confidences=None, context=None):
+    """Like generate_notes(), but also returns generation metadata so the
+    UI can say honestly which generator produced the text:
+      {"generator": "llm" | "template", "fallback_reason": str | None,
+       "style": ..., "prompt_version": ..., "llm_model": ...}
+    mode="template" never touches the network; an LLM mode falls back to the
+    deterministic, style-aware template on ANY failure (server down,
+    timeout, empty/unstructured output, missing package)."""
+    meta = {"generator": "template", "fallback_reason": None, "style": style,
+            "prompt_version": PROMPT_VERSIONS.get(style), "llm_model": None}
+    if mode in _LLM_MODES:
+        try:
+            text = generate_llm_notes(gloss_list, model=llm_model, style=style,
+                                      confidences=confidences, context=context)
+            meta.update(generator="llm", llm_model=llm_model or LLM_MODEL)
+            return text, meta
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            print(f"[infer] LLM ({LLM_PROVIDER} @ {LLM_BASE_URL}) failed: {reason}; "
+                  f"falling back to template notes")
+            meta["fallback_reason"] = reason[:300]
+    text = template_notes_from_tokens(gloss_list, style=style, confidences=confidences)
+    return text, meta
+
 
 def generate_notes(gloss_list, mode="template", llm_model=None, style="concise", **_legacy_kwargs):
-    """Turn a gloss sequence into notes.
+    """Turn a gloss sequence into notes (string only -- see
+    generate_notes_with_meta() for the variant that also reports whether
+    the LLM or the deterministic fallback produced it).
 
     mode="template" -> deterministic, always available, no network/LLM needed.
     mode="llm" / "llama_cpp" / "ollama" -> calls the configured local LLM
@@ -334,17 +495,14 @@ def generate_notes(gloss_list, mode="template", llm_model=None, style="concise",
     """
     if "ollama_model" in _legacy_kwargs and llm_model is None:
         llm_model = _legacy_kwargs["ollama_model"]
-
-    if mode in ("llm", "llama_cpp", "ollama"):
-        try:
-            return generate_llm_notes(gloss_list, model=llm_model, style=style)
-        except Exception as e:
-            print(f"[infer] LLM ({LLM_PROVIDER} @ {LLM_BASE_URL}) unavailable: {e}; "
-                  f"falling back to template notes")
-    return template_notes_from_tokens(gloss_list, style=style)
+    text, _ = generate_notes_with_meta(
+        gloss_list, mode=mode, llm_model=llm_model, style=style,
+        confidences=_legacy_kwargs.get("confidences"), context=_legacy_kwargs.get("context"),
+    )
+    return text
 
 
-def generate_llm_transcript(gloss_list, model=None, base_url=None):
+def generate_llm_transcript(gloss_list, model=None, base_url=None, confidences=None):
     """LLM-backed natural-language transcript (Layer 2 -- see
     notes_generator.py's module docstring on the three output layers).
     Deliberately its own function, not a style variant of
@@ -352,28 +510,27 @@ def generate_llm_transcript(gloss_list, model=None, base_url=None):
     flowing prose, not structured/headed notes."""
     if not gloss_list:
         raise ValueError("gloss_list is empty")
+    prompt = build_transcript_prompt(gloss_list, confidences=confidences)
+    raw = _chat(prompt, "You are an assistant that converts sign-language gloss sequences into a "
+                        "short natural-language transcript, strictly grounded in the glosses.",
+                model=model, base_url=base_url)
+    return clean_llm_output(raw, require_markdown_heading=False)
 
-    if base_url and base_url != LLM_BASE_URL:
-        from openai import OpenAI
-        client = OpenAI(base_url=base_url, api_key="not-needed")
-    else:
-        client = _get_llm_client()
 
-    prompt = build_transcript_prompt(gloss_list)
-    full_content = (
-        "You are an AI assistant that converts sign-language gloss sequences into a "
-        "short natural-language transcript.\n\n"
-        f"{prompt}"
-    )
-    response = client.chat.completions.create(
-        model=model or LLM_MODEL,
-        messages=[{"role": "user", "content": full_content}],
-        temperature=0.2,
-    )
-    text = (response.choices[0].message.content or "").strip()
-    if not text:
-        raise RuntimeError("LLM server returned an empty response")
-    return text
+def generate_transcript_with_meta(gloss_list, mode="template", llm_model=None, confidences=None):
+    meta = {"generator": "template", "fallback_reason": None,
+            "prompt_version": TRANSCRIPT_PROMPT_VERSION, "llm_model": None}
+    if mode in _LLM_MODES:
+        try:
+            text = generate_llm_transcript(gloss_list, model=llm_model, confidences=confidences)
+            meta.update(generator="llm", llm_model=llm_model or LLM_MODEL)
+            return text, meta
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+            print(f"[infer] LLM ({LLM_PROVIDER} @ {LLM_BASE_URL}) failed: {reason}; "
+                  f"falling back to template transcript")
+            meta["fallback_reason"] = reason[:300]
+    return template_transcript_from_tokens(gloss_list), meta
 
 
 def generate_transcript(gloss_list, mode="template", llm_model=None, **_legacy_kwargs):
@@ -382,22 +539,15 @@ def generate_transcript(gloss_list, mode="template", llm_model=None, **_legacy_k
     output). Same LLM-with-deterministic-fallback contract as
     generate_notes(): mode="template" never touches the network; mode="llm"
     falls back to the template on ANY failure so the caller always gets a
-    usable transcript back (RULE 17).
+    usable transcript back.
 
     Called exactly ONCE per Live Transcription session, when the user
-    stops it -- never continuously, never per-gloss (project brief section
-    21 / RULE 9: the live gloss stream itself is not "the transcript" yet,
-    only what this function returns after the LLM/template conversion is)."""
+    stops it -- never continuously, never per-gloss."""
     if "ollama_model" in _legacy_kwargs and llm_model is None:
         llm_model = _legacy_kwargs["ollama_model"]
-
-    if mode in ("llm", "llama_cpp", "ollama"):
-        try:
-            return generate_llm_transcript(gloss_list, model=llm_model)
-        except Exception as e:
-            print(f"[infer] LLM ({LLM_PROVIDER} @ {LLM_BASE_URL}) unavailable: {e}; "
-                  f"falling back to template transcript")
-    return template_transcript_from_tokens(gloss_list)
+    text, _ = generate_transcript_with_meta(gloss_list, mode=mode, llm_model=llm_model,
+                                            confidences=_legacy_kwargs.get("confidences"))
+    return text
 
 
 def predict_from_video(video_path, feature_output, frame_skip=8, **kwargs):

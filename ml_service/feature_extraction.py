@@ -25,6 +25,7 @@ Speed characteristics vs the v1 hand-only version:
 
 import csv
 import json
+import os
 import platform
 import argparse
 import urllib.request
@@ -138,7 +139,7 @@ def _write_feature_meta(out_dir, frame_skip, dataset_format, extra=None):
             {"name": name, "start": start, "end": end} for name, start, end in fs.FEATURE_GROUPS
         ],
         "mediapipe_version": mp.__version__,
-        "mediapipe_api": "tasks.python.vision.HolisticLandmarker",
+        "mediapipe_api": holistic_backend_name(),
         "python_version": platform.python_version(),
         "frame_skip": frame_skip,
         "dataset_format": dataset_format,
@@ -150,27 +151,115 @@ def _write_feature_meta(out_dir, frame_skip, dataset_format, extra=None):
     (Path(out_dir) / "feature_meta.json").write_text(json.dumps(meta, indent=2))
 
 
-# ── per-worker HolisticLandmarker (loaded ONCE per process, not per video) ────
+# ── Holistic backend selection ────────────────────────────────────────────────
+# Two MediaPipe implementations of the same Holistic graph produce the same
+# landmark topologies (21 per hand, 33 pose, 468(+10 iris) face) that
+# feature_schema.py indexes into:
+#   "solutions": mediapipe.solutions.holistic (classic API)
+#   "tasks":     mediapipe.tasks.python.vision.HolisticLandmarker
+# The Python Tasks HolisticLandmarker in mediapipe 0.10.21 (Windows, CPU)
+# hard-crashes the process ("packet.cc: Check failed: holder_ != nullptr
+# The packet is empty") after a few frames of ordinary FDMSE-ISL clips, in
+# both VIDEO and IMAGE mode -- reproduced during the stabilization audit
+# (see CHANGELOG.md). The classic solution runs the same clips reliably, so
+# it is the default for Python extraction. The browser keeps using the
+# Tasks HolisticLandmarker from @mediapipe/tasks-vision (no such crash
+# there); both resolve left/right hands from the body pose and share the
+# landmark numbering, so the feature vector layout is identical. The small
+# numeric differences between the two implementations are a documented
+# train/serve approximation (FEATURE_SCHEMA.md).
+HOLISTIC_BACKEND = os.environ.get("HOLISTIC_BACKEND", "solutions")
+
+
+def _solutions_available() -> bool:
+    return hasattr(mp, "solutions") and hasattr(mp.solutions, "holistic")
+
+
+class _SolutionsHolistic:
+    """Adapter giving mp.solutions.holistic the same per-frame interface as
+    the Tasks landmarker: detect(rgb, timestamp_ms) -> object with
+    left_hand_landmarks / right_hand_landmarks / pose_landmarks /
+    face_landmarks as plain landmark lists (or None)."""
+
+    name = "solutions.holistic"
+
+    def __init__(self):
+        self._h = mp.solutions.holistic.Holistic(
+            static_image_mode=False,
+            model_complexity=1,
+            smooth_landmarks=True,
+            refine_face_landmarks=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+    def detect(self, rgb, timestamp_ms):
+        r = self._h.process(rgb)
+
+        def lms(x):
+            return list(x.landmark) if x is not None else None
+
+        class _R:
+            pass
+
+        out = _R()
+        out.left_hand_landmarks = lms(r.left_hand_landmarks)
+        out.right_hand_landmarks = lms(r.right_hand_landmarks)
+        out.pose_landmarks = lms(r.pose_landmarks)
+        out.face_landmarks = lms(r.face_landmarks)
+        return out
+
+    def close(self):
+        self._h.close()
+
+
+class _TasksHolistic:
+    name = "tasks.HolisticLandmarker"
+
+    def __init__(self, model_asset_path):
+        options = mp_vision.HolisticLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_asset_path),
+            running_mode=mp_vision.RunningMode.VIDEO,
+            min_hand_landmarks_confidence=0.5,
+            min_pose_detection_confidence=0.5,
+            min_pose_landmarks_confidence=0.5,
+            min_face_detection_confidence=0.5,
+            min_face_landmarks_confidence=0.5,
+        )
+        self._lm = mp_vision.HolisticLandmarker.create_from_options(options)
+
+    def detect(self, rgb, timestamp_ms):
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        return self._lm.detect_for_video(mp_image, timestamp_ms)
+
+    def close(self):
+        self._lm.close()
+
+
+def make_holistic(model_asset_path=None):
+    if HOLISTIC_BACKEND == "solutions" and _solutions_available():
+        return _SolutionsHolistic()
+    return _TasksHolistic(ensure_model_asset(model_asset_path or DEFAULT_MODEL_ASSET_PATH))
+
+
+def holistic_backend_name() -> str:
+    return "solutions.holistic" if (HOLISTIC_BACKEND == "solutions" and _solutions_available()) \
+        else "tasks.HolisticLandmarker"
+
+
+# ── per-worker Holistic instance (loaded ONCE per process, not per video) ────
 _worker_landmarker = None
 
 
 def _init_worker(model_asset_path):
-    """multiprocessing.Pool initializer: loads one HolisticLandmarker per
-    worker PROCESS, reused across every video that process handles. Unlike
-    v1's lightweight Hands model (cheap enough to recreate per-video),
-    Holistic is three sub-models and worth loading once per worker."""
+    """multiprocessing.Pool initializer: loads one Holistic detector per
+    worker PROCESS, reused across every video that process handles.
+    Holistic is three sub-models and worth loading once per worker. Note:
+    the classic solution is a streaming tracker, so a fresh instance is
+    created per video in _process_one when tracking state must not leak
+    between clips (see there)."""
     global _worker_landmarker
-    base_options = BaseOptions(model_asset_path=model_asset_path)
-    options = mp_vision.HolisticLandmarkerOptions(
-        base_options=base_options,
-        running_mode=mp_vision.RunningMode.VIDEO,
-        min_hand_landmarks_confidence=0.5,
-        min_pose_detection_confidence=0.5,
-        min_pose_landmarks_confidence=0.5,
-        min_face_detection_confidence=0.5,
-        min_face_landmarks_confidence=0.5,
-    )
-    _worker_landmarker = mp_vision.HolisticLandmarker.create_from_options(options)
+    _worker_landmarker = model_asset_path  # remember the asset path only
 
 
 def _result_to_feature_vector(result) -> np.ndarray:
@@ -205,42 +294,104 @@ def _process_one(args):
         # Wrong-dimension cached file (e.g. leftover v1 hand-only output) --
         # do NOT silently reuse it (RULE 12). Re-extract.
 
-    landmarker = _worker_landmarker
-    owns_landmarker = False
-    if landmarker is None:
-        _init_worker(model_asset_path)
-        landmarker = _worker_landmarker
-        owns_landmarker = True
+    # A fresh detector per video: both Holistic implementations are
+    # streaming trackers (VIDEO mode / static_image_mode=False), so reusing
+    # one across clips would carry tracking state from the end of one
+    # video into the first frames of the next.
+    try:
+        landmarker = make_holistic(model_asset_path)
+    except Exception as exc:
+        return (vid, False, f"detector init failed: {exc}")
 
     cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        landmarker.close()
+        return (vid, False, "cannot open video (missing, corrupt or unsupported codec)")
     frames = []
     frame_idx = 0
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
     try:
         while True:
+            if frame_idx % frame_skip != 0:
+                # grab() advances without the BGR->RGB conversion/copy.
+                if not cap.grab():
+                    break
+                frame_idx += 1
+                continue
             ret, frame = cap.read()
             if not ret:
                 break
-            if frame_idx % frame_skip != 0:
-                frame_idx += 1
-                continue
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             timestamp_ms = int((frame_idx / fps) * 1000)
-            result = landmarker.detect_for_video(mp_image, timestamp_ms)
+            result = landmarker.detect(rgb, timestamp_ms)
             frames.append(_result_to_feature_vector(result))
             frame_idx += 1
+    except Exception as exc:
+        return (vid, False, f"extraction failed at frame {frame_idx}: {exc}")
     finally:
         cap.release()
-        if owns_landmarker:
-            landmarker.close()
+        landmarker.close()
 
     if len(frames) == 0:
-        return (vid, False, "no frames")
+        return (vid, False, "no frames decoded")
 
     np.save(out_path, np.stack(frames))
     return (vid, True, "ok")
+
+
+def _process_one_legacy_v1(args):
+    """Schema v1 (hand-only, 126 dims) extraction, reproducing the ORIGINAL
+    v1 extractor exactly (git b6a11c7): mp.solutions.hands with
+    model_complexity=0, max 2 hands, hands placed in detection order. Only
+    used to serve/evaluate the legacy v1 model -- never for v2 training."""
+    vid, video_path, out_path, frame_skip = args
+    if not hasattr(mp, "solutions"):
+        raise RuntimeError("Legacy v1 extraction needs mediapipe.solutions (mediapipe<=0.10.21).")
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return (vid, False, "cannot open video (missing, corrupt or unsupported codec)")
+    frames = []
+    frame_idx = 0
+    try:
+        with mp.solutions.hands.Hands(static_image_mode=False, max_num_hands=2, model_complexity=0,
+                                      min_detection_confidence=0.5, min_tracking_confidence=0.5) as hands:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                if frame_idx % frame_skip != 0:
+                    frame_idx += 1
+                    continue
+                res = hands.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                detected = [list(h.landmark) for h in (res.multi_hand_landmarks or [])]
+                frames.append(fs.build_legacy_v1_vector(detected))
+                frame_idx += 1
+    finally:
+        cap.release()
+    if not frames:
+        return (vid, False, "no frames decoded")
+    np.save(out_path, np.stack(frames))
+    return (vid, True, "ok")
+
+
+def extract_single_video_for_schema(video_path, out_dir, schema_version,
+                                    frame_skip=DEFAULT_FRAME_SKIP, model_asset_path=None):
+    """Extract features for one video in the schema a given MODEL expects
+    (api.py routes by the served checkpoint's feature_schema_version).
+    Returns (path or None, message)."""
+    video_path = Path(video_path)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{video_path.stem}.npy"
+    if str(schema_version) == fs.LEGACY_SCHEMA_VERSION:
+        _, ok, msg = _process_one_legacy_v1((video_path.stem, str(video_path), str(out_path), frame_skip))
+    elif str(schema_version) == fs.FEATURE_SCHEMA_VERSION:
+        _, ok, msg = _process_one((video_path.stem, str(video_path), str(out_path), frame_skip,
+                                   model_asset_path or DEFAULT_MODEL_ASSET_PATH))
+    else:
+        raise fs.FeatureSchemaError(f"No extractor for feature_schema_version={schema_version!r}")
+    return (out_path if ok else None), msg
 
 
 # ── public helper: process a SINGLE video (used by api.py) ───────────────────
@@ -256,7 +407,7 @@ def extract_single_video(video_path, out_dir, frame_skip=DEFAULT_FRAME_SKIP,
     out_dir    = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{video_path.stem}.npy"
-    model_asset_path = ensure_model_asset(model_asset_path or DEFAULT_MODEL_ASSET_PATH)
+    model_asset_path = model_asset_path or DEFAULT_MODEL_ASSET_PATH
 
     _, ok, _ = _process_one((video_path.stem, str(video_path), str(out_path), frame_skip, model_asset_path))
     return out_path if ok else None
@@ -340,23 +491,27 @@ def extract_fdmse_dataset(metadata_csv, dataset_root, out_dir,
             if max_videos and len(tasks) >= max_videos:
                 break
 
-    _run_extraction(tasks, frame_skip, n_workers, model_asset_path)
+    _run_extraction(tasks, frame_skip, n_workers, model_asset_path,
+                    failures_path=out_dir / "extraction_failures.csv")
     _write_feature_meta(
         out_dir, frame_skip, dataset_format="fdmse",
         extra={"metadata_csv": str(metadata_csv), "splits": sorted(splits) if splits else "all"},
     )
 
 
-def _run_extraction(tasks, frame_skip, n_workers, model_asset_path=None):
+def _run_extraction(tasks, frame_skip, n_workers, model_asset_path=None, failures_path=None):
     """Shared multiprocessing runner for both dataset formats. `tasks` is a
     list of (video_id, video_path, out_path) triples; frame_skip is the
-    same for every task in a given run so it's injected here. Each worker
-    process loads its own HolisticLandmarker once via _init_worker (see
-    module docstring), rather than per video."""
-    model_asset_path = ensure_model_asset(model_asset_path or DEFAULT_MODEL_ASSET_PATH)
+    same for every task in a given run so it's injected here. Failed
+    videos (unreadable/corrupt/no frames) are listed in `failures_path`
+    (CSV) so the dataset audit can report them instead of them silently
+    disappearing from training."""
+    model_asset_path = model_asset_path or DEFAULT_MODEL_ASSET_PATH
+    if holistic_backend_name() != "solutions.holistic":
+        model_asset_path = ensure_model_asset(model_asset_path)
     full_tasks = [(vid, vp, op, frame_skip, model_asset_path) for vid, vp, op in tasks]
     print(f"[feature_extraction] {len(full_tasks)} videos | workers={n_workers} | frame_skip={frame_skip} "
-          f"| schema=v{fs.FEATURE_SCHEMA_VERSION} ({fs.FEATURE_DIM} dims)")
+          f"| schema=v{fs.FEATURE_SCHEMA_VERSION} ({fs.FEATURE_DIM} dims) | backend={holistic_backend_name()}")
 
     if not full_tasks:
         print("[feature_extraction] No matching videos found on disk — "
@@ -364,14 +519,25 @@ def _run_extraction(tasks, frame_skip, n_workers, model_asset_path=None):
               "in your metadata file.")
         return
 
-    done = failed = 0
+    done = cached = 0
+    failures = []
     with Pool(processes=n_workers, initializer=_init_worker, initargs=(model_asset_path,)) as pool:
         for vid, ok, msg in tqdm(
-                pool.imap_unordered(_process_one, full_tasks), total=len(full_tasks)):
-            if ok: done   += 1
-            else:  failed += 1
+                pool.imap_unordered(_process_one, full_tasks, chunksize=4), total=len(full_tasks)):
+            if ok and msg == "cached":
+                cached += 1
+            elif ok:
+                done += 1
+            else:
+                failures.append((vid, msg))
 
-    print(f"[feature_extraction] Done={done}  Failed/skipped={failed}")
+    print(f"[feature_extraction] Extracted={done}  Cached={cached}  Failed={len(failures)}")
+    if failures_path and failures:
+        with open(failures_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["video_id", "reason"])
+            w.writerows(failures)
+        print(f"[feature_extraction] Failure list -> {failures_path}")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

@@ -221,27 +221,100 @@ class FeatureSchemaError(ValueError):
     silently mix old and new feature representations."""
 
 
-def assert_feature_dim(dim: int, context: str = "") -> None:
-    """Fail clearly (not with a downstream shape-mismatch crash three
-    layers away) when a loaded feature array doesn't match the current
-    schema's dimension. `context` should be something like a file path or
-    'checkpoint' so the error is actionable."""
-    if dim != FEATURE_DIM:
-        where = f" ({context})" if context else ""
-        hint = (
-            " These look like old hand-only features (schema v1, 126 dims)."
-            if dim == 126
-            else ""
-        )
+# ---------------------------------------------------------------------------
+# Legacy schema v1 ("hand_only") -- kept ONLY so the previously trained
+# hand-only model (models/sign_recog, 126 dims) stays usable for rollback
+# and comparison. It is a separate, explicitly-versioned schema: a v1 model
+# is only ever fed v1 vectors and a v2 model only v2 vectors (see
+# SCHEMA_DIMS / assert_feature_dim(expected_dim=...)). It is never mixed
+# into v2 training data.
+#
+# v1 layout (reproduced from the original feature_extraction.py in git
+# history, commit b6a11c7): two 21x(x,y,z) hand slots = 126 dims, filled in
+# MediaPipe's DETECTION order (slot 0 = first detected hand, slot 1 =
+# second), NOT by handedness. That order-dependence is a known weakness of
+# v1 and one of the reasons v2 exists.
+# ---------------------------------------------------------------------------
+LEGACY_SCHEMA_VERSION = "1.0"
+LEGACY_FEATURE_TYPE = "hand_only"
+LEGACY_FEATURE_DIM = 2 * HAND_FEATURE_DIM  # 126
+
+SCHEMA_DIMS = {
+    LEGACY_SCHEMA_VERSION: LEGACY_FEATURE_DIM,
+    FEATURE_SCHEMA_VERSION: FEATURE_DIM,
+}
+SCHEMA_TYPES = {
+    LEGACY_SCHEMA_VERSION: LEGACY_FEATURE_TYPE,
+    FEATURE_SCHEMA_VERSION: FEATURE_TYPE,
+}
+
+
+def feature_dim_for_schema(schema_version: str) -> int:
+    """Feature dimension of a known schema version; raises
+    FeatureSchemaError for an unknown version instead of guessing."""
+    try:
+        return SCHEMA_DIMS[str(schema_version)]
+    except KeyError:
         raise FeatureSchemaError(
-            f"Feature dimension mismatch{where}: got {dim}, but the current "
-            f"feature schema is v{FEATURE_SCHEMA_VERSION} "
-            f"('{FEATURE_TYPE}'), which expects {FEATURE_DIM} dims per "
-            f"frame ({HAND_FEATURE_DIM} left hand + {HAND_FEATURE_DIM} "
-            f"right hand + {POSE_FEATURE_DIM} pose + {FACE_FEATURE_DIM} "
-            f"face).{hint} Re-extract features with the current "
-            f"feature_extraction.py, or point at a schema-v2 feature "
-            f"directory (see FEATURE_SCHEMA.md)."
+            f"Unknown feature_schema_version {schema_version!r}; known versions: "
+            f"{sorted(SCHEMA_DIMS)}"
+        ) from None
+
+
+def build_legacy_v1_vector(hands_in_detection_order) -> np.ndarray:
+    """Schema v1 (126-dim) vector from up to two hand landmark lists given
+    in detection order. Missing hands -> zeros. Mirrors the original v1
+    `_extract_keypoints` exactly (slot 0 = first hand, slot 1 = second)."""
+    hands = [h for h in (hands_in_detection_order or []) if h][:2]
+    out = np.zeros(LEGACY_FEATURE_DIM, dtype=np.float32)
+    for slot, hand in enumerate(hands):
+        out[slot * HAND_FEATURE_DIM:(slot + 1) * HAND_FEATURE_DIM] = _flatten_hand(hand)
+    return out
+
+
+def legacy_v1_from_v2(vec_or_seq: np.ndarray) -> np.ndarray:
+    """Approximate v1 vector(s) from v2 vector(s): the detected hands are
+    packed into the v1 slots in (left, right) order, skipping a missing
+    hand -- so a single visible hand always lands in slot 0, which is what
+    v1's detection-order layout produced for one-handed signing. With two
+    hands the v1 order was arbitrary (whichever MediaPipe found first), so
+    this is an approximation, documented in FEATURE_SCHEMA.md."""
+    x = np.asarray(vec_or_seq, dtype=np.float32)
+    single = x.ndim == 1
+    x2 = x[None, :] if single else x
+    assert_feature_dim(x2.shape[-1], context="legacy_v1_from_v2 input")
+    out = np.zeros((len(x2), LEGACY_FEATURE_DIM), dtype=np.float32)
+    for i, row in enumerate(x2):
+        left = row[0:HAND_FEATURE_DIM]
+        right = row[HAND_FEATURE_DIM:2 * HAND_FEATURE_DIM]
+        present = [h for h in (left, right) if np.any(h)]
+        for slot, h in enumerate(present):
+            out[i, slot * HAND_FEATURE_DIM:(slot + 1) * HAND_FEATURE_DIM] = h
+    return out[0] if single else out
+
+
+def assert_feature_dim(dim: int, context: str = "", expected_dim: int | None = None) -> None:
+    """Fail clearly (not with a downstream shape-mismatch crash three
+    layers away) when a loaded feature array doesn't match the expected
+    schema's dimension. `expected_dim` defaults to the current schema v2
+    (FEATURE_DIM); pass a model's own input_dim to validate against the
+    schema that model was trained on. `context` should be something like a
+    file path or 'checkpoint' so the error is actionable."""
+    expected = FEATURE_DIM if expected_dim is None else int(expected_dim)
+    if dim != expected:
+        where = f" ({context})" if context else ""
+        hint = ""
+        if dim == LEGACY_FEATURE_DIM:
+            hint = " These look like old hand-only features (schema v1, 126 dims)."
+        elif dim == FEATURE_DIM:
+            hint = " These look like hand+body+face features (schema v2, 285 dims)."
+        raise FeatureSchemaError(
+            f"Feature dimension mismatch{where}: got {dim}, expected {expected}. "
+            f"Schema v{FEATURE_SCHEMA_VERSION} ('{FEATURE_TYPE}') is {FEATURE_DIM} dims "
+            f"({HAND_FEATURE_DIM} left hand + {HAND_FEATURE_DIM} right hand + "
+            f"{POSE_FEATURE_DIM} pose + {FACE_FEATURE_DIM} face); legacy schema "
+            f"v{LEGACY_SCHEMA_VERSION} ('{LEGACY_FEATURE_TYPE}') is {LEGACY_FEATURE_DIM} dims."
+            f"{hint} Features and model must use the same schema (see FEATURE_SCHEMA.md)."
         )
 
 

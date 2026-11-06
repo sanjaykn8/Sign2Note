@@ -86,6 +86,35 @@ def build_checkpoint_metadata(
     }
 
 
+def check_checkpoint_self_consistent(ckpt: dict) -> List[str]:
+    """Is this checkpoint internally consistent with ONE known feature
+    schema? (Different question from check_checkpoint_compatible(), which
+    asks "is it compatible with the CURRENT schema v2".) A legacy v1
+    (126-dim, hand-only) checkpoint is self-consistent and may be served,
+    but only with v1 features -- infer.py/api.py route extraction by the
+    checkpoint's own schema so v1/v2 are never mixed. Returns reasons
+    (empty list = OK); never raises."""
+    reasons: List[str] = []
+    schema = str(ckpt.get("feature_schema_version", fs.LEGACY_SCHEMA_VERSION))
+    if schema not in fs.SCHEMA_DIMS:
+        return [f"unknown feature_schema_version={schema!r} (known: {sorted(fs.SCHEMA_DIMS)})"]
+    input_dim = ckpt.get("input_dim")
+    if input_dim is None:
+        reasons.append("checkpoint has no input_dim")
+    elif int(input_dim) != fs.SCHEMA_DIMS[schema]:
+        reasons.append(
+            f"checkpoint input_dim={input_dim} does not match its own feature_schema_version="
+            f"{schema!r} (expects {fs.SCHEMA_DIMS[schema]})"
+        )
+    for key in ("label2id", "max_len"):
+        if key not in ckpt:
+            reasons.append(f"checkpoint is missing {key!r}")
+    arch = ckpt.get("architecture", DEFAULT_ARCHITECTURE)
+    if arch not in SUPPORTED_ARCHITECTURES:
+        reasons.append(f"unsupported architecture {arch!r}")
+    return reasons
+
+
 def check_checkpoint_compatible(
     ckpt: dict, current_vocab_label2id: Optional[Dict[str, int]] = None
 ) -> List[str]:

@@ -40,15 +40,22 @@ def api_client(tmp_path, monkeypatch):
     infer_module._torch_cache = None
     infer_module._onnx_cache = None
 
-    def fake_extract_single_video(video_path, out_dir, frame_skip=8, model_asset_path=None):
+    # Isolate from the real config/vocab.json (the baseline version of this
+    # fixture didn't, so the vocab-drift warning leaked into
+    # test_model_meta_includes_v2_fields_and_compatibility_warnings).
+    monkeypatch.setattr(api_module, "VOCAB_PATH", tmp_path / "no_vocab.json")
+
+    def fake_extract_for_schema(video_path, out_dir, schema_version, frame_skip=8, model_asset_path=None):
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / (Path(video_path).stem + ".npy")
-        arr = np.random.rand(40, fs.FEATURE_DIM).astype(np.float32)
+        dim = fs.feature_dim_for_schema(schema_version)
+        arr = np.random.rand(40, dim).astype(np.float32)
         np.save(out_path, arr)
-        return out_path
+        return out_path, "ok"
 
-    monkeypatch.setattr(api_module, "extract_single_video", fake_extract_single_video)
+    monkeypatch.setattr(api_module, "extract_single_video_for_schema", fake_extract_for_schema)
+    monkeypatch.setattr(api_module, "_probe_video", lambda path: (30.0, 10.0))
 
     return TestClient(api_module.app)
 

@@ -1,0 +1,67 @@
+{
+  "metadata_csv": "data/data_meta/metadata.csv",
+  "num_rows": 40033,
+  "invalid_labels": [],
+  "num_classes": 2002,
+  "splits": {
+    "train": 20016,
+    "test": 16014,
+    "val": 4003
+  },
+  "views": {
+    "front": 40033
+  },
+  "duplicate_rows": 0,
+  "duplicate_video_files": 0,
+  "videos_in_multiple_splits": [],
+  "samples_per_class": {
+    "min": 13,
+    "max": 20,
+    "mean": 19.997,
+    "median": 20.0,
+    "classes_below_20": {
+      "0/Zero": 13
+    }
+  },
+  "classes_per_split": {
+    "test": 2002,
+    "train": 2002,
+    "val": 2002
+  },
+  "classes_missing_from_split": {
+    "test": [],
+    "train": [],
+    "val": []
+  },
+  "signers_per_split": {
+    "test": [
+      "s0004",
+      "s0006",
+      "s0010",
+      "s0014",
+      "s0016",
+      "s0017",
+      "s0019",
+      "s0020"
+    ],
+    "train": [
+      "s0001",
+      "s0002",
+      "s0005",
+      "s0007",
+      "s0008",
+      "s0009",
+      "s0011",
+      "s0012",
+      "s0013",
+      "s0018"
+    ],
+    "val": [
+      "s0003",
+      "s0015"
+    ]
+  },
+  "signers_in_multiple_splits": [],
+  "signer_independent_splits": true,
+  "missing_video_files": []
+}

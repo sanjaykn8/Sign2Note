@@ -35,7 +35,23 @@ def resolve_train_val_indices(
         f"index_csv row count ({len(df)}) doesn't match dataset length ({n}) -- "
         f"the caller must be reading the same file this function just read."
     )
+    return resolve_train_val_indices_from_df(df, split_col, force_random_split, val_split, seed)
 
+
+def resolve_train_val_indices_from_df(
+    df: pd.DataFrame,
+    split_col: str,
+    force_random_split: bool,
+    val_split: float,
+    seed: int,
+) -> Tuple[List[int], List[int], bool]:
+    """Same as resolve_train_val_indices(), but on the dataset's OWN rows
+    (SignDataset.df). Positions returned are positions in `df`, which is
+    what torch Subset needs. This is what train.py uses: SignDataset drops
+    index rows that have no feature file or are outside the vocabulary,
+    so positions in a fresh read of index_csv would not line up."""
+    df = df.reset_index(drop=True)
+    n = len(df)
     if not force_random_split and split_col in df.columns:
         values = df[split_col].astype(str).str.lower()
         train_idx = df.index[values == "train"].tolist()
@@ -77,6 +93,16 @@ def resolve_test_indices(index_csv: str, split_col: str, n: int) -> List[int]:
     assert len(df) == n, (
         f"index_csv row count ({len(df)}) doesn't match dataset length ({n})."
     )
+    return resolve_split_indices_from_df(df, split_col, "test", source=index_csv)
+
+
+def resolve_split_indices_from_df(df: pd.DataFrame, split_col: str, split_name: str,
+                                  source: str = "dataset") -> List[int]:
+    """Positions (in `df`) of rows whose split_col == split_name ('test' or
+    'val'/'validation'). No fallback: a missing split is an error -- never
+    substitute another split's rows."""
+    df = df.reset_index(drop=True)
+    index_csv = source
     if split_col not in df.columns:
         raise ValueError(
             f"{index_csv} has no '{split_col}' column -- there is no official test split "
@@ -84,10 +110,11 @@ def resolve_test_indices(index_csv: str, split_col: str, n: int) -> List[int]:
             f"includes a 'split' column, or pass a different --split_col."
         )
     values = df[split_col].astype(str).str.lower()
-    test_idx = df.index[values == "test"].tolist()
+    wanted = {"val", "validation"} if split_name in ("val", "validation") else {split_name}
+    test_idx = df.index[values.isin(wanted)].tolist()
     if not test_idx:
         raise ValueError(
-            f"{index_csv}'s '{split_col}' column has no rows labeled 'test' "
+            f"{index_csv}'s '{split_col}' column has no rows labeled {split_name!r} "
             f"(found values: {sorted(values.unique())[:10]}) -- nothing to evaluate. "
             f"Do not substitute val or train rows for this; that would defeat the "
             f"point of a held-out test set (RULE 11)."

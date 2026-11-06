@@ -1,23 +1,43 @@
+"""Sign2Notes ML service (FastAPI).
+
+Two separate services live behind this one process (they share a process
+only for deployment convenience on the main laptop -- their APIs, inputs
+and outputs are independent):
+
+  RECOGNITION  (sign -> glosses)
+    POST /recognize          keypoints (canonical schema of the served model) -> glosses/events
+    POST /recognize/video    video file -> glosses/events (server-side extraction)
+    GET  /model/meta         served model's metadata + compatibility status
+    GET  /model/onnx         the served model's ONNX export (for in-browser recognition)
+
+  LANGUAGE GENERATION  (glosses -> text)
+    POST /notes              glosses -> structured notes (concise/detailed/academic)
+    POST /transcript         glosses -> natural-language transcript
+
+  COMBINED (kept for backward compatibility with the upload page)
+    POST /process            video -> recognition -> notes, in one call
+
+  GET /health                liveness + model/LLM availability (no secrets)
+
+Model selection: MODEL_PATH / ONNX_PATH env vars, else the newest available
+of models/sign_recog_v2 (schema v2, hand+body+face) and models/sign_recog
+(legacy schema v1, hand-only). Whatever is served, uploads are converted
+to the SAME feature schema that model was trained on (never mixed).
+"""
+import logging
 import os
 import tempfile
+import traceback
 from collections import Counter
 from pathlib import Path
 from typing import List, Optional
 
 import cv2
 from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel, Field, field_validator
-
-import feature_schema as fs
-from checkpoint_meta import check_checkpoint_compatible
-from feature_extraction import extract_single_video
-from infer import (
-    predict_from_features, predict_from_array, generate_notes, generate_transcript, get_model_meta,
-    LLM_PROVIDER, LLM_MODEL, LLM_BASE_URL,
-)
-from notes_generator import SUPPORTED_STYLES
 
 try:
     from dotenv import load_dotenv
@@ -25,128 +45,361 @@ try:
 except ImportError:
     pass
 
-app = FastAPI(title="Sign2Notes ML Service", version="2.0")
+import feature_schema as fs
+from checkpoint_meta import check_checkpoint_compatible, check_checkpoint_self_consistent
+from feature_extraction import extract_single_video_for_schema
+from infer import (
+    predict_from_features, predict_from_array, generate_notes_with_meta,
+    generate_transcript_with_meta, get_model_meta,
+    LLM_PROVIDER, LLM_MODEL, LLM_BASE_URL,
+)
+from notes_generator import SUPPORTED_STYLES, MAX_CONTEXT_CHARS
+
+log = logging.getLogger("sign2notes.ml")
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+app = FastAPI(title="Sign2Notes ML Service", version="2.1")
+
+# The browser never talks to this service directly (it goes through the
+# Express gateway), so CORS here only needs the local dev origins.
+_cors = os.environ.get("ML_CORS_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080,"
+                                          "http://localhost:3001,http://127.0.0.1:3001")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080", "http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=[o.strip() for o in _cors.split(",") if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 BASE = Path(__file__).resolve().parents[1]
-# Configurable via environment so a deployment doesn't need to hardcode a
-# machine-specific path (project brief section 46) -- e.g. a distributed
-# client running its own local recognition model would point these at its
-# own checkpoint, separate from the main server's.
-CHECKPOINT = Path(os.environ.get("MODEL_PATH", BASE / "models/sign_recog_v2/checkpoints/demo.pt"))
-ONNX = Path(os.environ.get("ONNX_PATH", BASE / "models/sign_recog_v2/sign_recog.onnx"))
+
+
+def _resolve_default_checkpoint() -> Path:
+    """Newest schema first: v2 best -> v2 demo -> legacy v1 best -> legacy v1
+    demo. best.pt is preferred over demo.pt because train.py exports the
+    ONNX file from best.pt's weights (the label mapping is identical, but
+    using the same weights for the torch fallback keeps the two in sync)."""
+    for rel in ("models/sign_recog_v2/checkpoints/best.pt",
+                "models/sign_recog_v2/checkpoints/demo.pt",
+                "models/sign_recog/checkpoints/best.pt",
+                "models/sign_recog/checkpoints/demo.pt"):
+        if (BASE / rel).exists():
+            return BASE / rel
+    return BASE / "models/sign_recog_v2/checkpoints/best.pt"
+
+
+CHECKPOINT = Path(os.environ.get("MODEL_PATH") or _resolve_default_checkpoint())
+ONNX = Path(os.environ.get("ONNX_PATH") or (CHECKPOINT.parent.parent / "sign_recog.onnx"))
 VOCAB_PATH = Path(os.environ.get("VOCAB_PATH", BASE / "config/vocab.json"))
 TMP = BASE / "data/tmp"
 TMP.mkdir(parents=True, exist_ok=True)
 
-# Default confidence threshold for the /process endpoint. Overridable per
-# request via the `threshold` form field; this just sets the form default.
 DEFAULT_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.55))
 
-# Request-size guards (section 39: "validate maximum gloss count", "reject
-# excessively large requests"). Deliberately generous defaults -- these
-# exist to stop pathological/abusive input, not to constrain normal use;
-# a real lecture session might reasonably produce a few hundred glosses.
+# Temporal sampling. The recognition models are trained on FDMSE-ISL clips
+# (60 fps) sampled every 8th frame = 7.5 samples/second. A fixed frame_skip
+# of 8 applied to a 30 fps upload samples at 3.75 Hz, so every sign looks
+# twice as fast as anything seen in training. Unless the caller passes an
+# explicit frame_skip, /process and /recognize/video derive it from the
+# upload's fps so the sampling RATE matches training.
+TRAINING_SAMPLE_HZ = float(os.environ.get("TRAINING_SAMPLE_HZ", 7.5))
+# Sliding-window length (in sampled frames) for continuous video. Training
+# samples are isolated clips of ~20-35 sampled frames zero-padded to
+# max_len (64); a 64-real-frame window (8.5 s) would contain several signs.
+# Windows of WINDOW_FRAMES real frames, zero-padded to max_len exactly like
+# training, match the training distribution. See ARCHITECTURE.md.
+DEFAULT_WINDOW_FRAMES = int(os.environ.get("WINDOW_FRAMES", 24))
+DEFAULT_STRIDE = int(os.environ.get("WINDOW_STRIDE", 4))
+
 MAX_UPLOAD_SIZE_BYTES = int(os.environ.get("MAX_UPLOAD_SIZE", 200 * 1024 * 1024))  # 200 MB
 MAX_GLOSS_COUNT = int(os.environ.get("MAX_GLOSS_COUNT", 2000))
-MAX_RECOGNIZE_FRAMES = int(os.environ.get("MAX_RECOGNIZE_FRAMES", 20000))  # ~a few minutes of keypoints
+MAX_RECOGNIZE_FRAMES = int(os.environ.get("MAX_RECOGNIZE_FRAMES", 20000))
+MAX_VIDEO_SECONDS = float(os.environ.get("MAX_VIDEO_SECONDS", 30 * 60))
+ALLOWED_VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 VALID_NOTES_MODES = ("template", "llm")
 
 
 def _current_vocab_label2id():
-    """Best-effort read of the currently configured vocabulary, for the
-    checkpoint-compatibility check (RULE 26) -- returns None (skips that
-    part of the check) rather than raising if the file is missing or
-    malformed, since a missing vocab.json shouldn't take down /health or
-    /model/meta."""
+    """Best-effort read of config/vocab.json for the vocab-drift warning;
+    returns None rather than raising (a missing vocab.json must not take
+    down /health or /model/meta)."""
     try:
         import json
-        return json.loads(VOCAB_PATH.read_text()).get("label2id")
+        return json.loads(VOCAB_PATH.read_text(encoding="utf-8")).get("label2id")
     except Exception:
         return None
 
 
+def model_status() -> dict:
+    """Whether the configured model can actually be served -- based on
+    loading and checking its metadata, not just on a file existing.
+    {ready, reason, meta, backend}."""
+    if not CHECKPOINT.exists():
+        return {"ready": False, "reason": f"No checkpoint at {CHECKPOINT}. Train one (see SETUP.md).",
+                "meta": None}
+    try:
+        meta = get_model_meta(str(CHECKPOINT))
+    except Exception as exc:
+        log.exception("could not read checkpoint %s", CHECKPOINT)
+        return {"ready": False, "reason": f"Checkpoint could not be read: {exc}", "meta": None}
+    problems = check_checkpoint_self_consistent({
+        "feature_schema_version": meta["feature_schema_version"], "input_dim": meta["input_dim"],
+        "label2id": meta["label2id"], "max_len": meta["max_len"], "architecture": meta["architecture"],
+    })
+    if problems:
+        return {"ready": False, "reason": "; ".join(problems), "meta": meta}
+    return {"ready": True, "reason": None, "meta": meta}
+
+
+def _err(status: int, message: str, **extra):
+    return JSONResponse({"error": message, **extra}, status_code=status)
+
+
+def _internal_error(where: str, exc: Exception):
+    """Log the full traceback server-side; return an understandable message."""
+    log.error("%s failed: %s\n%s", where, exc, traceback.format_exc())
+    return _err(500, f"{where} failed: {exc}")
+
+
 @app.get("/health")
 def health():
+    st = model_status()
+    meta = st["meta"] or {}
     return {
         "status": "ok",
-        "model_ready": CHECKPOINT.exists(),
+        "model_ready": st["ready"],
+        "model_problem": st["reason"],
+        "model_version": meta.get("model_version"),
+        "feature_schema_version": meta.get("feature_schema_version"),
+        "is_legacy_schema": meta.get("is_legacy_schema"),
         "onnx_ready": ONNX.exists(),
         "llm_provider": LLM_PROVIDER,
         "llm_model": LLM_MODEL,
-        "llm_base_url": LLM_BASE_URL,
-        "feature_schema_version": fs.FEATURE_SCHEMA_VERSION,
+        "current_feature_schema_version": fs.FEATURE_SCHEMA_VERSION,
     }
 
 
 @app.get("/model/meta")
 def model_meta():
-    """Model metadata (max_len, input_dim, label vocabulary, architecture,
-    feature_schema_version, vocab_hash, best_val_accuracy, ...) for
-    clients that run inference themselves -- specifically the browser
-    webcam demo, which loads the ONNX model client-side via
-    onnxruntime-web, and any distributed client checking whether its own
-    local model is still compatible with what the server currently
-    expects (RULE 25/26). `compatibility_warnings` is populated (but
-    non-fatal here -- this endpoint still returns 200) whenever the
-    checkpoint's recorded schema/vocab doesn't match config/vocab.json;
-    callers that need a hard stop on incompatibility should check that
-    list themselves, or call /recognize, which DOES fail clearly on a
-    real incompatibility (see below)."""
-    if not CHECKPOINT.exists():
-        return JSONResponse({"error": "No trained checkpoint found."}, status_code=404)
-    try:
-        meta = get_model_meta(str(CHECKPOINT))
-        ckpt_like = {
-            "feature_schema_version": meta.get("feature_schema_version"),
-            "input_dim": meta.get("input_dim"),
-            "vocab_hash": meta.get("vocab_hash"),
-        }
-        meta["compatibility_warnings"] = check_checkpoint_compatible(
-            ckpt_like, current_vocab_label2id=_current_vocab_label2id()
-        )
-        return meta
-    except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+    """Metadata of the SERVED model (max_len, input_dim, label vocabulary,
+    architecture, feature_schema_version, vocab_hash, metrics, sampling
+    rate) so a client can decide whether its local recognizer is
+    compatible before using it. `compatibility_warnings` lists drift
+    between the checkpoint and config/vocab.json (informational)."""
+    st = model_status()
+    if st["meta"] is None:
+        return _err(404 if not CHECKPOINT.exists() else 500, st["reason"])
+    meta = dict(st["meta"])
+    meta["compatibility_warnings"] = [
+        w for w in check_checkpoint_compatible(
+            {"feature_schema_version": meta["feature_schema_version"],
+             "input_dim": meta["input_dim"], "vocab_hash": meta["vocab_hash"]},
+            current_vocab_label2id=_current_vocab_label2id(),
+        ) if "vocab_hash" in w
+    ] + ([st["reason"]] if st["reason"] else [])
+    meta["ready"] = st["ready"]
+    meta["onnx_available"] = ONNX.exists()
+    meta["sample_hz"] = TRAINING_SAMPLE_HZ
+    meta["window_frames"] = DEFAULT_WINDOW_FRAMES
+    meta["window_stride"] = DEFAULT_STRIDE
+    return meta
 
 
 @app.get("/model/onnx")
 def model_onnx():
-    """Serves the exported ONNX model file directly so the browser can
-    fetch it and run it locally with onnxruntime-web -- no video, keypoints,
-    or predictions ever need to leave the browser for the webcam flow."""
+    """Serves the served model's ONNX export so the browser can run
+    recognition locally with onnxruntime-web (only keypoints-derived
+    predictions stay in the browser; no video leaves it)."""
     if not ONNX.exists():
-        return JSONResponse(
-            {"error": "No ONNX model found. Run train.py to export one."},
-            status_code=404,
-        )
+        return _err(404, "No ONNX model found. Run train.py to export one.")
     return FileResponse(str(ONNX), media_type="application/octet-stream", filename="sign_recog.onnx")
 
 
 def _best_guess_gloss(segments):
-    """Fallback for when no window crosses the confidence threshold:
-    majority-vote the raw per-window predictions (ignoring the threshold)
-    and return the single most-predicted label. Always returns a
-    non-empty list as long as at least one window was processed, so
-    /process never has to hand back an empty result for an uploaded video.
-
-    NOTE: this fallback is deliberately specific to /process (the "upload a
-    video, always get notes" flow). The live webcam session (see /notes and
-    the frontend's session logic) does the opposite on purpose: low-
-    confidence predictions are surfaced as "please repeat" and are NOT
-    added to the session history. Two different UX goals for two different
-    interaction modes -- see ARCHITECTURE.md."""
+    """Fallback for /process when no window crosses the confidence
+    threshold: majority-vote the raw per-window predictions and return the
+    single most-predicted label, flagged low_confidence in the response.
+    Deliberately specific to the upload flow (live sessions instead show
+    "uncertain" and add nothing)."""
     if not segments:
         return []
     counts = Counter(s["label"] for s in segments)
     top_label, _ = counts.most_common(1)[0]
     return [top_label]
+
+
+async def _save_upload(file: UploadFile) -> Path:
+    """Stream the upload to a temp file in 1 MB chunks, enforcing the size
+    limit WHILE streaming (the previous version read the whole body into
+    memory first, then checked the size)."""
+    suffix = Path(file.filename or "upload.mp4").suffix.lower() or ".mp4"
+    if suffix not in ALLOWED_VIDEO_SUFFIXES:
+        raise ValueError(f"Unsupported file type {suffix!r}. Allowed: {sorted(ALLOWED_VIDEO_SUFFIXES)}")
+    size = 0
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=TMP) as tmp:
+        path = Path(tmp.name)
+        try:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_UPLOAD_SIZE_BYTES:
+                    raise OverflowError(
+                        f"Uploaded file exceeds the {MAX_UPLOAD_SIZE_BYTES // (1024 * 1024)} MB limit "
+                        f"(MAX_UPLOAD_SIZE)."
+                    )
+                tmp.write(chunk)
+        except BaseException:
+            tmp.close()
+            path.unlink(missing_ok=True)
+            raise
+    if size == 0:
+        path.unlink(missing_ok=True)
+        raise ValueError("Uploaded file is empty.")
+    return path
+
+
+def _probe_video(path: Path):
+    cap = cv2.VideoCapture(str(path))
+    try:
+        if not cap.isOpened():
+            return None, None
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+    finally:
+        cap.release()
+    if not fps or fps <= 0 or fps > 1000:
+        fps = 25.0
+    return fps, (frames / fps if frames > 0 else None)
+
+
+def _auto_frame_skip(fps: float) -> int:
+    return max(1, int(round(fps / TRAINING_SAMPLE_HZ)))
+
+
+def _recognize_video_sync(video_path: Path, frame_skip: Optional[int], stride: int,
+                          threshold: float, window_frames: int) -> dict:
+    """Shared by /process and /recognize/video: probe -> extract features in
+    the served model's schema -> sliding-window recognition. Returns the
+    recognition result dict, or raises ValueError with a user-facing
+    message."""
+    st = model_status()
+    if not st["ready"]:
+        raise RuntimeError(f"Recognition model unavailable: {st['reason']}")
+    schema = st["meta"]["feature_schema_version"]
+
+    fps, duration = _probe_video(video_path)
+    if fps is None:
+        raise ValueError("The file could not be opened as a video (corrupt or unsupported codec).")
+    if duration and duration > MAX_VIDEO_SECONDS:
+        raise ValueError(f"Video is {duration / 60:.1f} min long; the limit is "
+                         f"{MAX_VIDEO_SECONDS / 60:.0f} min (MAX_VIDEO_SECONDS).")
+    skip = frame_skip if frame_skip and frame_skip > 0 else _auto_frame_skip(fps)
+
+    feature_dir = TMP / "features"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    feature_path = None
+    try:
+        feature_path, msg = extract_single_video_for_schema(
+            str(video_path), str(feature_dir), schema, frame_skip=skip)
+        if feature_path is None:
+            raise ValueError(f"No frames could be processed from this video ({msg}).")
+        result = predict_from_features(
+            str(feature_path), checkpoint_path=str(CHECKPOINT), onnx_path=str(ONNX),
+            stride=stride, threshold=threshold, fps=fps, frame_skip=skip,
+            window_frames=window_frames,
+        )
+    finally:
+        if feature_path and Path(feature_path).exists():
+            Path(feature_path).unlink(missing_ok=True)
+
+    result["video_fps"] = fps
+    result["video_duration_seconds"] = duration
+    result["frame_skip"] = skip
+    result["window_frames"] = window_frames
+    result["stride"] = stride
+    result["threshold"] = threshold
+    result["model_version"] = st["meta"].get("model_version")
+    result["feature_schema_version"] = schema
+    result["low_confidence"] = False
+    if not result["gloss_list"]:
+        top = sorted(result["segments"], key=lambda s: -s["confidence"])[:5]
+        log.info("no window crossed threshold=%s (mean top conf=%.3f); best guess. top=%s",
+                 threshold, result["top_confidence"],
+                 [(s["label"], round(s["confidence"], 3)) for s in top])
+        result["gloss_list"] = _best_guess_gloss(result["segments"])
+        result["low_confidence"] = True
+    return result
+
+
+async def _run_video_recognition(file, frame_skip, stride, threshold, window_frames):
+    video_path = None
+    try:
+        try:
+            video_path = await _save_upload(file)
+        except OverflowError as exc:
+            return None, _err(413, str(exc))
+        except ValueError as exc:
+            return None, _err(422, str(exc))
+        try:
+            # Heavy CPU work runs in a worker thread: doing it inline in an
+            # async endpoint blocked the event loop, so /health and every
+            # other request hung for the whole duration of an upload.
+            result = await run_in_threadpool(
+                _recognize_video_sync, video_path, frame_skip, stride, threshold, window_frames)
+        except ValueError as exc:
+            return None, _err(422, str(exc))
+        except RuntimeError as exc:
+            if "unavailable" in str(exc):
+                return None, _err(503, str(exc))
+            return None, _internal_error("Recognition", exc)
+        except Exception as exc:
+            return None, _internal_error("Recognition", exc)
+        return result, None
+    finally:
+        # Privacy invariant: the raw upload is temporary only.
+        if video_path is not None:
+            Path(video_path).unlink(missing_ok=True)
+
+
+def _recognition_payload(result: dict) -> dict:
+    return {
+        "glosses": result["gloss_list"],
+        "gloss_list": result["gloss_list"],
+        "events": result["events"],
+        "segments": result["segments"],
+        "confidence": result["top_confidence"],
+        "low_confidence": result.get("low_confidence", False),
+        "backend": result["backend"],
+        "providers": result.get("providers", []),
+        "model_version": result.get("model_version"),
+        "feature_schema_version": result.get("feature_schema_version"),
+        "video_fps": result.get("video_fps"),
+        "video_duration_seconds": result.get("video_duration_seconds"),
+        "frame_skip": result.get("frame_skip"),
+        "window_frames": result.get("window_frames"),
+    }
+
+
+@app.post("/recognize/video")
+async def recognize_video(
+    file: UploadFile = File(...),
+    frame_skip: Optional[int] = Form(None),
+    stride: int = Form(DEFAULT_STRIDE),
+    threshold: float = Form(DEFAULT_THRESHOLD),
+    window_frames: int = Form(DEFAULT_WINDOW_FRAMES),
+):
+    """Recognition only (video in, ordered timestamped glosses out). For
+    clients that cannot extract landmarks themselves. No notes."""
+    if not (0.0 <= threshold <= 1.0) or stride < 1 or window_frames < 4:
+        return _err(422, "threshold must be in [0,1], stride >= 1, window_frames >= 4")
+    result, error = await _run_video_recognition(file, frame_skip, stride, threshold, window_frames)
+    if error is not None:
+        return error
+    return _recognition_payload(result)
 
 
 @app.post("/process")
@@ -155,116 +408,61 @@ async def process_upload(
     notes_mode: str = Form("template"),
     llm_model: str = Form(None),
     style: str = Form("concise"),
-    frame_skip: int = Form(8),
-    stride: int = Form(12),
+    frame_skip: Optional[int] = Form(None),
+    stride: int = Form(DEFAULT_STRIDE),
     threshold: float = Form(DEFAULT_THRESHOLD),
+    window_frames: int = Form(DEFAULT_WINDOW_FRAMES),
 ):
-    """Long-video-capable inference endpoint. Handles clips of any length:
-    keypoints are extracted frame-by-frame (never loading the whole video
-    into memory), sliding windows are run through the model in bounded-size
-    chunks (see infer.INFER_CHUNK_SIZE), and Viterbi smoothing collapses
-    the per-window predictions into an ordered, timestamped `events` list
-    alongside the flat `gloss_list` for backward compatibility."""
+    """Upload page's one-call flow: recognition (as /recognize/video) and
+    then notes (as /notes) on the ordered gloss sequence. Long videos are
+    handled frame-by-frame and in bounded inference chunks; Viterbi
+    smoothing turns per-window predictions into ordered, timestamped
+    `events`."""
     if notes_mode not in VALID_NOTES_MODES:
-        return JSONResponse(
-            {"error": f"Invalid notes_mode {notes_mode!r}. Expected one of {VALID_NOTES_MODES}."},
-            status_code=422,
-        )
+        return _err(422, f"Invalid notes_mode {notes_mode!r}. Expected one of {VALID_NOTES_MODES}.")
     if style not in SUPPORTED_STYLES:
-        return JSONResponse(
-            {"error": f"Invalid style {style!r}. Expected one of {SUPPORTED_STYLES}."},
-            status_code=422,
-        )
-    if not CHECKPOINT.exists() and not ONNX.exists():
-        return JSONResponse({"error": "No trained model found. Run build_index.py and train.py first."}, status_code=500)
+        return _err(422, f"Invalid style {style!r}. Expected one of {SUPPORTED_STYLES}.")
+    if not (0.0 <= threshold <= 1.0) or stride < 1 or window_frames < 4:
+        return _err(422, "threshold must be in [0,1], stride >= 1, window_frames >= 4")
 
-    suffix = Path(file.filename or "upload.mp4").suffix or ".mp4"
-    video_path = None
-    feature_path = None
+    result, error = await _run_video_recognition(file, frame_skip, stride, threshold, window_frames)
+    if error is not None:
+        return error
+
+    # Notes are generated from the timestamped events (ordered, duplicate-
+    # collapsed) when available, with their confidences.
+    if result["events"]:
+        ordered = [e["label"] for e in result["events"]]
+        confidences = [e["confidence"] for e in result["events"]]
+    else:
+        ordered = result["gloss_list"]
+        confidences = None
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix, dir=TMP) as tmp:
-            video_path = Path(tmp.name)
-            content = await file.read()
-            tmp.write(content)
-
-        if len(content) == 0:
-            return JSONResponse({"error": "Uploaded file is empty."}, status_code=422)
-        if len(content) > MAX_UPLOAD_SIZE_BYTES:
-            return JSONResponse(
-                {"error": f"Uploaded file ({len(content)} bytes) exceeds the "
-                          f"{MAX_UPLOAD_SIZE_BYTES}-byte limit (MAX_UPLOAD_SIZE)."},
-                status_code=413,
-            )
-
-        # Probe fps before extraction so window timestamps can be computed
-        # against the *original* video's timeline, not the subsampled one.
-        cap = cv2.VideoCapture(str(video_path))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        cap.release()
-        if not fps or fps <= 0:
-            fps = 25.0
-
-        feature_dir = TMP / "features"
-        feature_dir.mkdir(parents=True, exist_ok=True)
-        feature_path = extract_single_video(str(video_path), str(feature_dir), frame_skip=frame_skip)
-        if feature_path is None:
-            return JSONResponse({"error": "No usable hand keypoints were detected. Make sure hands are visible and well-lit."}, status_code=422)
-
-        result = predict_from_features(
-            str(feature_path),
-            checkpoint_path=str(CHECKPOINT),
-            onnx_path=str(ONNX),
-            stride=stride,
-            threshold=threshold,
-            fps=fps,
-            frame_skip=frame_skip,
-        )
-
-        low_confidence = False
-        if not result["gloss_list"]:
-            top = sorted(result["segments"], key=lambda s: -s["confidence"])[:5]
-            print(
-                f"[api] No window crossed threshold={threshold} "
-                f"(mean top confidence={result['top_confidence']:.3f}); "
-                f"falling back to best guess. Top windows: "
-                f"{[(s['label'], round(s['confidence'], 3)) for s in top]}"
-            )
-            result["gloss_list"] = _best_guess_gloss(result["segments"])
-            low_confidence = True
-
-        # Prefer the timestamped events' labels for note generation when
-        # available -- they're deduplicated/collapsed the same way as
-        # gloss_list but retain the (start_time, end_time) span, matching
-        # the requirement that longer videos yield an *ordered sequence* of
-        # signs rather than one flat prediction.
-        ordered_glosses = [e["label"] for e in result["events"]] if result["events"] else result["gloss_list"]
-
-        notes = generate_notes(
-            ordered_glosses, mode=notes_mode,
-            llm_model=llm_model, style=style,
-        )
-
-        return {
-            "notes_md": notes,
-            "gloss_list": result["gloss_list"],
-            "events": result["events"],
-            "segments": result["segments"],
-            "confidence": result["top_confidence"],
-            "backend": result["backend"],
-            "providers": result["providers"],
-            "low_confidence": low_confidence,
-            "video_fps": fps,
-        }
+        notes, gen_meta = await run_in_threadpool(
+            generate_notes_with_meta, ordered, notes_mode, llm_model, style, confidences, None)
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
-    finally:
-        # Privacy invariant: raw upload and extracted demo features are temporary only.
-        for p in [video_path, feature_path]:
-            try:
-                if p and Path(p).exists():
-                    Path(p).unlink()
-            except Exception:
-                pass
+        return _internal_error("Notes generation", exc)
+
+    payload = _recognition_payload(result)
+    payload.update({"notes_md": notes, "generation": gen_meta, "style": style})
+    return payload
+
+
+def _validate_glosses(v):
+    cleaned = [str(g).strip() for g in v]
+    if any(not g for g in cleaned):
+        raise ValueError("gloss_list contains an empty gloss")
+    if any(len(g) > 100 for g in cleaned):
+        raise ValueError("gloss_list contains a gloss longer than 100 characters")
+    return cleaned
+
+
+def _validate_confidences(v):
+    if v is None:
+        return v
+    if any((c is not None) and not (0.0 <= float(c) <= 1.0) for c in v):
+        raise ValueError("confidences must be within [0, 1]")
+    return v
 
 
 class NotesRequest(BaseModel):
@@ -272,6 +470,23 @@ class NotesRequest(BaseModel):
     notes_mode: str = "template"
     llm_model: Optional[str] = None
     style: str = "concise"
+    # Optional per-gloss recognition confidences (same length as
+    # gloss_list): low-confidence glosses are marked uncertain in the
+    # prompt/fallback instead of being stated as fact.
+    confidences: Optional[List[Optional[float]]] = None
+    # Optional user-typed context (e.g. a lecture title). Never treated as
+    # a source of facts -- see notes_generator._context_block.
+    context: Optional[str] = Field(None, max_length=MAX_CONTEXT_CHARS)
+
+    @field_validator("gloss_list")
+    @classmethod
+    def _check_glosses(cls, v):
+        return _validate_glosses(v)
+
+    @field_validator("confidences")
+    @classmethod
+    def _check_confidences(cls, v):
+        return _validate_confidences(v)
 
     @field_validator("notes_mode")
     @classmethod
@@ -288,29 +503,40 @@ class NotesRequest(BaseModel):
         return v
 
 
+def _aligned(confidences, glosses):
+    return confidences if confidences is not None and len(confidences) == len(glosses) else None
+
+
 @app.post("/notes")
 def notes_from_glosses(req: NotesRequest):
-    """Generate notes directly from an already-recognized gloss sequence,
-    with no video/keypoints involved. This is what the live webcam session
-    calls on "Generate Notes": all keypoint extraction and ONNX inference
-    for the webcam flow happens client-side in the browser (see
-    LIVE_WEBCAM in ARCHITECTURE.md) so that raw video and keypoints never
-    leave the machine -- only the final recognized gloss labels (plain
-    words like "Market" or "Whistle", not video/imagery) are sent here.
-    Validation (empty list, too many glosses, invalid mode/style) is
-    handled by NotesRequest's field validators above -- FastAPI returns a
-    422 automatically before this function body ever runs, per RULE
-    (section 24): 'Reject: empty gloss arrays, malformed requests,
-    excessively large requests, invalid modes.'"""
-    notes = generate_notes(req.gloss_list, mode=req.notes_mode,
-                           llm_model=req.llm_model, style=req.style)
-    return {"notes_md": notes, "style": req.style, "notes_mode": req.notes_mode}
+    """Language generation only: ordered glosses -> structured notes. No
+    video or keypoints involved (the live modes send only the recognized
+    gloss words here). Validation errors return 422 automatically."""
+    try:
+        notes, meta = generate_notes_with_meta(
+            req.gloss_list, mode=req.notes_mode, llm_model=req.llm_model, style=req.style,
+            confidences=_aligned(req.confidences, req.gloss_list), context=req.context,
+        )
+    except Exception as exc:
+        return _internal_error("Notes generation", exc)
+    return {"notes_md": notes, "style": req.style, "notes_mode": req.notes_mode, "generation": meta}
 
 
 class TranscriptRequest(BaseModel):
     gloss_list: List[str] = Field(..., min_length=1, max_length=MAX_GLOSS_COUNT)
     notes_mode: str = "template"
     llm_model: Optional[str] = None
+    confidences: Optional[List[Optional[float]]] = None
+
+    @field_validator("gloss_list")
+    @classmethod
+    def _check_glosses(cls, v):
+        return _validate_glosses(v)
+
+    @field_validator("confidences")
+    @classmethod
+    def _check_confidences(cls, v):
+        return _validate_confidences(v)
 
     @field_validator("notes_mode")
     @classmethod
@@ -322,44 +548,34 @@ class TranscriptRequest(BaseModel):
 
 @app.post("/transcript")
 def transcript_from_glosses(req: TranscriptRequest):
-    """Generate a natural-language TRANSCRIPT from an already-recognized
-    gloss sequence -- Live Transcription mode's "Stop & Generate" step.
-    This is deliberately a separate endpoint from /notes, not a `style`
-    value on it: a transcript (flowing prose, Layer 2) and structured
-    notes (headed/bulleted, Layer 3) are different output layers built
-    from different prompts (see notes_generator.py's module docstring),
-    and Live Transcription mode wants to be able to show BOTH from the
-    same gloss sequence (project brief section 21: "Provide both: A.
-    recognized gloss transcript, B. generated natural-language
-    transcript") -- calling /transcript here and /notes separately (with
-    the same gloss_list) is exactly that, without conflating the two
-    response shapes into one endpoint.
-
-    No `style` field: a transcript's register doesn't vary the way notes
-    do (concise/detailed/academic) -- it's always "flowing prose in gloss
-    order." Called ONCE, only when the user stops the session -- see
-    RULE 9: never call the live gloss stream itself an LLM-generated
-    transcript until this endpoint has actually been called."""
-    transcript = generate_transcript(req.gloss_list, mode=req.notes_mode, llm_model=req.llm_model)
-    return {"transcript": transcript, "notes_mode": req.notes_mode}
+    """Language generation only: ordered glosses -> natural-language
+    TRANSCRIPT (flowing prose). Separate from /notes (structured notes);
+    Live Transcription calls this once, when the user stops the session."""
+    try:
+        transcript, meta = generate_transcript_with_meta(
+            req.gloss_list, mode=req.notes_mode, llm_model=req.llm_model,
+            confidences=_aligned(req.confidences, req.gloss_list),
+        )
+    except Exception as exc:
+        return _internal_error("Transcript generation", exc)
+    return {"transcript": transcript, "notes_mode": req.notes_mode, "generation": meta}
 
 
 class RecognizeRequest(BaseModel):
-    """Recognition-only request: pre-extracted keypoints, no video. This is
-    the API a distributed client with local landmark extraction but no
-    local recognition MODEL uses to fall back to the main server (RULE 8 /
-    section 23 tier 2: 'keypoints -> network -> main server model ->
-    glosses'). Deliberately does NOT accept or return LLM notes (section
-    43: recognition and note generation are separate concerns -- use
-    /notes afterward if notes are wanted)."""
+    """Recognition-only request: pre-extracted keypoints in the SERVED
+    model's feature schema (see GET /model/meta -> feature_schema_version /
+    input_dim). Used by clients that extract landmarks locally but have no
+    compatible local recognition model. Returns glosses, never notes."""
     features: List[List[float]] = Field(
-        ..., description="(num_frames, FEATURE_DIM) canonical hand+body+face keypoints, "
+        ..., description="(num_frames, input_dim) keypoints in the served model's schema, "
                           "see FEATURE_SCHEMA.md."
     )
     fps: Optional[float] = Field(None, description="Original capture fps, for real timestamps in `events`.")
     frame_skip: int = 8
-    stride: int = 12
-    threshold: float = Field(default=None)
+    stride: int = DEFAULT_STRIDE
+    threshold: Optional[float] = Field(default=None)
+    window_frames: Optional[int] = Field(default=None, description="Real frames per window; "
+                                         "default: the whole input if it fits in max_len.")
 
     @field_validator("features")
     @classmethod
@@ -377,42 +593,33 @@ class RecognizeRequest(BaseModel):
 
 @app.post("/recognize")
 def recognize_from_features(req: RecognizeRequest):
-    """Recognition-only endpoint for clients that extract keypoints
-    locally but don't have (or can't run) the recognition model itself --
-    e.g. a lightweight/older device, or before the local ONNX model has
-    finished downloading. Returns glosses/events/confidence, nothing else;
-    call /notes separately with the returned glosses if notes are wanted
-    (RULE: 'the LLM must never be responsible for sign recognition').
-
-    Checks the request's feature dimension against the CURRENT schema
-    before attempting inference, so a client running an old (schema v1,
-    126-dim) local extractor gets a clear, actionable error instead of a
-    confusing shape-mismatch crash deep in the model (RULE 26)."""
-    if not CHECKPOINT.exists() and not ONNX.exists():
-        return JSONResponse({"error": "No trained model found on the server."}, status_code=503)
-
+    """Recognition-only endpoint for keypoints. Checks the request's feature
+    dimension against the SERVED model's schema first, so an incompatible
+    client gets a clear, actionable error instead of a shape crash."""
+    st = model_status()
+    if not st["ready"]:
+        return _err(503, f"No usable recognition model on the server: {st['reason']}")
+    meta = st["meta"]
+    expected = int(meta["input_dim"])
     actual_dim = len(req.features[0])
-    if actual_dim != fs.FEATURE_DIM:
-        return JSONResponse(
-            {
-                "error": (
-                    f"Feature dimension mismatch: got {actual_dim}, server expects "
-                    f"{fs.FEATURE_DIM} (feature_schema_version={fs.FEATURE_SCHEMA_VERSION}). "
-                    f"Local recognition model and feature schema are incompatible -- "
-                    f"re-extract keypoints with the current schema, or fall back to /process "
-                    f"(sending video instead) if that isn't possible client-side."
-                ),
-                "expected_feature_dim": fs.FEATURE_DIM,
-                "got_feature_dim": actual_dim,
-            },
-            status_code=422,
+    if actual_dim != expected:
+        return _err(
+            422,
+            f"Feature dimension mismatch: got {actual_dim}, the served model expects {expected} "
+            f"(feature_schema_version={meta['feature_schema_version']}). The client's feature "
+            f"extractor and the server's recognition model are incompatible -- extract keypoints "
+            f"with the matching schema, or send the video to /recognize/video instead.",
+            expected_feature_dim=expected, got_feature_dim=actual_dim,
+            expected_feature_schema_version=meta["feature_schema_version"],
         )
-
+    if req.threshold is not None and not (0.0 <= req.threshold <= 1.0):
+        return _err(422, "threshold must be in [0, 1]")
     try:
         threshold = req.threshold if req.threshold is not None else DEFAULT_THRESHOLD
         result = predict_from_array(
             req.features, checkpoint_path=str(CHECKPOINT), onnx_path=str(ONNX),
-            stride=req.stride, threshold=threshold, fps=req.fps, frame_skip=req.frame_skip,
+            stride=max(1, req.stride), threshold=threshold, fps=req.fps, frame_skip=req.frame_skip,
+            window_frames=req.window_frames,
         )
         return {
             "glosses": result["gloss_list"],
@@ -420,10 +627,11 @@ def recognize_from_features(req: RecognizeRequest):
             "segments": result["segments"],
             "confidence": result["top_confidence"],
             "backend": result["backend"],
-            "model_version": str(CHECKPOINT),
-            "feature_schema_version": fs.FEATURE_SCHEMA_VERSION,
+            "model_version": meta.get("model_version"),
+            "feature_schema_version": meta["feature_schema_version"],
         }
     except fs.FeatureSchemaError as exc:
-        return JSONResponse({"error": str(exc)}, status_code=422)
+        return _err(422, str(exc))
     except Exception as exc:
-        return JSONResponse({"error": str(exc)}, status_code=500)
+        return _internal_error("Recognition", exc)
+
