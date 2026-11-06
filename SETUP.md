@@ -1,220 +1,140 @@
 # Setup
 
-This covers installation and configuration in detail. For the fastest path
-from a fresh clone to a running demo, see the **Quick Start** in
-`README.md` — this document is the reference for each step, including
-options and troubleshooting-adjacent notes.
+All commands are run from the repository root unless a `cd` is shown.
+PowerShell syntax; on macOS/Linux use `ml_service/venv/bin/python` and
+`run.sh`.
 
 ## Prerequisites
 
-- **Python** 3.10–3.12 (3.12 recommended; matches what this project was
-  developed/tested against)
-- **Node.js** 18+ (for both `backend/` and `frontend/`)
-- **A webcam** (for the live webcam or live transcription demos; live
-  transcription can alternatively use screen/tab capture instead of a
-  camera -- see "Live Transcription mode" in `README.md`). Neither is
-  needed for video upload.
-- **Optional:** an NVIDIA GPU for faster training (CPU-only training works,
-  just slower); recommendations below assume an **RTX 4050 6GB laptop GPU**
-- **Optional:** [Ollama](https://ollama.com) or
-  [llama.cpp](https://github.com/ggml-org/llama.cpp) for LLM-backed notes
-  (the deterministic template mode needs neither)
+- Python **3.11** (MediaPipe 0.10.21 wheels exist for 3.9–3.12)
+- Node.js 20+ (verified with 22.22)
+- Optional: an NVIDIA GPU for faster training (everything also runs on CPU)
+- Optional: the FDMSE-ISL dataset under `data/` (only needed to train/evaluate)
+- Optional: Ollama or llama.cpp for LLM-generated notes
 
-## 1. Python environment
+## 1. ML service (Python)
+
+Use a dedicated virtual environment. On the development laptop the global
+Python 3.11 had TensorFlow built for NumPy 1.x next to NumPy 2.x, which
+makes `import mediapipe` fail (MediaPipe imports TensorFlow if present); an
+isolated venv avoids that entirely.
 
 ```powershell
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r ml_service/requirements.txt
+py -3.11 -m venv ml_service\venv
+ml_service\venv\Scripts\python -m pip install --upgrade pip
+# CPU-only PyTorch (smaller download). For CUDA, install the matching wheel from pytorch.org instead.
+ml_service\venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+ml_service\venv\Scripts\python -m pip install -r ml_service\requirements.txt
 ```
 
-This installs: `torch`, `torchvision`, `mediapipe`, `opencv-python`,
-`numpy`, `pandas`, `tqdm`, `scikit-learn` and `matplotlib` (for
-`evaluate.py`'s metrics/confusion-matrix), `onnx`, `onnxruntime`,
-`fastapi`, `uvicorn[standard]`, `python-multipart`, `openai` (for LLM
-notes/transcript mode), and `python-dotenv` (optional `.env` loading).
+Check: `ml_service\venv\Scripts\python -c "import torch, mediapipe; print(mediapipe.__version__)"` → `0.10.21`.
 
-> If you have an NVIDIA GPU and want CUDA-accelerated training, install
-> the CUDA build of PyTorch instead of the default CPU wheel — see
-> [pytorch.org/get-started](https://pytorch.org/get-started/locally/) for
-> the exact command for your CUDA version. `onnxruntime-gpu` can replace
-> `onnxruntime` the same way (commented out in `requirements.txt`).
+Configuration: copy `ml_service/.env.example` to `ml_service/.env` and
+adjust. Important variables:
 
-## 2. Node services
+| Variable | Default | Meaning |
+|---|---|---|
+| `MODEL_PATH` | v2 `best.pt` if present, else legacy `models/sign_recog/checkpoints/best.pt` | Recognition checkpoint to serve |
+| `ONNX_PATH` | `<model dir>/sign_recog.onnx` | ONNX export paired with that checkpoint (dims are checked) |
+| `CONFIDENCE_THRESHOLD` | 0.55 | Default window threshold for uploads |
+| `TRAINING_SAMPLE_HZ` | 7.5 | Sampling rate the model was trained at (60 fps / frame_skip 8) |
+| `WINDOW_FRAMES`, `WINDOW_STRIDE` | 24, 4 | Sliding-window length/stride in sampled frames |
+| `MAX_UPLOAD_SIZE`, `MAX_VIDEO_SECONDS` | 200 MB, 1800 s | Upload limits |
+| `LLM_PROVIDER`, `LLM_MODEL`, `LLM_BASE_URL` | llama_cpp, gemma4, http://127.0.0.1:8081/v1 | Language-generation server |
+| `LLM_TIMEOUT`, `LLM_MAX_RETRIES` | 90 s, 1 | Bounded LLM calls (then deterministic fallback) |
+| `HOLISTIC_BACKEND` | `solutions` | Python landmark extractor (`tasks` crashes on 0.10.21/Windows) |
+
+Start: `cd ml_service; .\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8000`
+
+Keep `--host 127.0.0.1`: only the gateway talks to the ML service.
+
+## 2. Gateway (Express)
 
 ```powershell
-cd backend
-npm install
-cd ..\frontend
-npm install
+cd backend; npm install; npm start
 ```
 
-`frontend/package.json` includes `onnxruntime-web` and
-`@mediapipe/tasks-vision` for the live webcam/transcription demos, and
-`jspdf`/`docx` for client-side PDF/Word export -- no separate install
-step needed.
+| Variable | Default | Meaning |
+|---|---|---|
+| `PORT` | 3001 | |
+| `HOST` | `127.0.0.1`, or `0.0.0.0` when a token is set | Bind address |
+| `SIGN2NOTES_API_TOKEN` | (none) | Shared access token; required for network access |
+| `CORS_ORIGINS` | reflect origin | Comma-separated allowed origins |
+| `ML_SERVICE_URL` | http://127.0.0.1:8000/process | ML service location |
+| `MAX_UPLOAD_MB` | 200 | Upload limit |
+| `TIMEOUT_*_MS` | see server.js | Upstream timeouts |
 
-## 3. LLM notes (optional)
-
-Copy `ml_service/.env.example` to `ml_service/.env` and adjust:
-
-```env
-LLM_PROVIDER=llama_cpp   # or "ollama"
-LLM_MODEL=gemma4         # llama.cpp: your --alias. Ollama: the model tag.
-LLM_BASE_URL=http://127.0.0.1:8081/v1
-CONFIDENCE_THRESHOLD=0.55
-INFER_CHUNK_SIZE=64
-```
-
-### Option A — llama.cpp
+## 3. Frontend (React/Vite)
 
 ```powershell
-llama-server.exe `
-    -m "C:\path\to\model.gguf" `
-    --host 127.0.0.1 --port 8081 `
-    -ngl 99 -c 2048 --alias gemma4
+cd frontend; npm install; npm run dev     # http://localhost:8080
+npm run build                             # production build into frontend/dist
 ```
 
-`--alias` must match `LLM_MODEL` in `.env`.
+Optional `frontend/.env` — see `frontend/.env.example` (`VITE_API_URL`,
+`VITE_MAX_UPLOAD_MB`). The server address can also be changed at runtime in
+**Connection settings**.
 
-### Option B — Ollama
+The browser downloads the MediaPipe WASM runtime and the Holistic model
+from jsDelivr / Google's model storage the first time a live mode starts
+(cached afterwards). See PRIVACY.md for self-hosting them.
+
+## 4. Language generation (optional)
+
+Any OpenAI-compatible local server works.
+
+- **llama.cpp**: `llama-server.exe -m <model.gguf> --port 8081 --alias gemma4`
+  → `LLM_PROVIDER=llama_cpp`, `LLM_BASE_URL=http://127.0.0.1:8081/v1`, `LLM_MODEL=gemma4`
+- **Ollama**: `ollama pull <model>` → `LLM_PROVIDER=ollama`,
+  `LLM_BASE_URL=http://127.0.0.1:11434/v1`, `LLM_MODEL=<model>`
+
+If the server is unreachable, slow (`LLM_TIMEOUT`) or returns unusable
+output, the deterministic generator is used and the app labels the result
+"LLM unavailable — deterministic fallback used".
+
+## Connecting other devices
+
+1. On the main laptop set a token and start the gateway:
+   `$env:SIGN2NOTES_API_TOKEN = "<long random string>"; cd backend; npm start`
+   (it now listens on all interfaces). Allow ports 3001 and 8080 through
+   Windows Firewall for the **Private** network profile only.
+2. Find the laptop's LAN address: `ipconfig` → IPv4 address, e.g. 192.168.1.20.
+3. On the other device open `http://192.168.1.20:8080`, click the status
+   indicator (top right) → **Connection settings**, keep the address
+   `http://192.168.1.20:3001`, enter the token, **Save**.
+4. **Camera / screen capture on other devices needs HTTPS** (browsers only
+   allow them on `https://` or `localhost`). Video Upload works over plain
+   http. For the live modes, create a certificate for the laptop's address
+   (for example with `mkcert 192.168.1.20`, installing mkcert's root CA on
+   the client devices) and start the frontend with:
+   ```powershell
+   $env:SIGN2NOTES_HTTPS_KEY="C:\certs\192.168.1.20-key.pem"; $env:SIGN2NOTES_HTTPS_CERT="C:\certs\192.168.1.20.pem"; cd frontend; npm run dev
+   ```
+   The gateway is then reached by the page over `http://...:3001`, which
+   browsers block as mixed content from an https page — put the gateway
+   behind the same certificate (e.g. a reverse proxy) or use the client's
+   own local install. This is a documented limitation, not automated here.
+
+Never expose the gateway to the public internet; the token is a shared
+secret for a trusted LAN.
+
+## 5. Verifying the setup
 
 ```powershell
-ollama pull gemma4:e2b
+curl http://localhost:3001/health
 ```
 
-Ollama listens on port 11434 by default and exposes the same
-OpenAI-compatible `/v1/chat/completions` endpoint llama.cpp does, so:
+Expect `"gateway":"ok"` and `ml.model_ready: true`. `ml.feature_schema_version`
+shows which model is served (`1.0` = legacy hand-only, `2.0` = hand+body+face).
 
-```env
-LLM_PROVIDER=ollama
-LLM_MODEL=gemma4:e2b
-LLM_BASE_URL=http://127.0.0.1:11434/v1
-```
-
-Either way, if the LLM server isn't reachable when notes are requested in
-`notes_mode="llm"`, the app automatically falls back to deterministic
-template notes — you don't need to have it running to use the app.
-
-## 4. FDMSE-ISL dataset
-
-See "Dataset" in `README.md` for the full layout and column reference.
-Expected structure:
-
-```text
-data/
-  data_meta/
-    metadata_400.csv   # curated 400-class subset (recommended default)
-    metadata.csv        # full 2,002 classes
-    metadata_atomic.csv
-    metadata_composite.csv
-    classes.txt
-    classes_400.txt
-  FDMSE-ISL/
-    data/
-      s0001/front/*.mp4
-      ...
-```
-
-## 5. Training pipeline
-
-See "Training" and "Evaluation" in `README.md` for full copy-paste
-commands, RTX 4050 recommendations (batch size, sequence length, frame
-skip, workers, AMP), and how to run `evaluate.py` against the official
-test split.
-
-## 6. Running the services
-
-Three terminals:
+## 6. Tests
 
 ```powershell
-# Terminal 1 — ML service
-cd ml_service
-python -m uvicorn api:app --host 127.0.0.1 --port 8000
-
-# Terminal 2 — Node gateway
-cd backend
-npm start
-
-# Terminal 3 — React frontend
-cd frontend
-npm run dev
+cd ml_service; .\venv\Scripts\python -m pytest -q        # 167 tests
+cd backend; npm test                                     # 4 tests
+cd frontend; npx vitest run                              # 82 tests
+cd frontend; npx tsc --noEmit -p tsconfig.app.json; npx vite build
 ```
 
-Open `http://localhost:8080`. `/` is video upload, `/webcam` is the live
-webcam demo, `/live-transcription` is live transcription mode.
-
-## 7. Running a distributed client (optional)
-
-A second laptop can run just the frontend + its own local recognition
-model, pointed at the first laptop's backend for notes/transcript
-generation (and as a recognition fallback if its own local model isn't
-available or fails a compatibility check -- see "Distributed
-architecture" in `README.md`):
-
-```powershell
-# On the CLIENT laptop:
-cd frontend
-npm install
-```
-
-Create `frontend/.env` pointing `VITE_API_URL` at the MAIN laptop's
-backend (see "Frontend environment variables" below) -- e.g.
-`VITE_API_URL=http://192.168.1.20:3001` (the main laptop's LAN IP; find
-it with `ipconfig` on Windows or `ifconfig`/`ip addr` on Linux/Mac). Then:
-
-```powershell
-npm run dev -- --host
-```
-
-`--host` makes Vite's dev server listen on the LAN, not just localhost.
-On the MAIN laptop, `ml_service/api.py`'s CORS origins currently only
-allow `localhost`/`127.0.0.1` by default (see `api.py`'s
-`CORSMiddleware` setup) -- add the client's origin
-(`http://<client-ip>:8080`) there for a real multi-laptop setup, since
-browsers enforce CORS based on the page's own origin, not the API's.
-
-The client's browser will try to load its own local ONNX model from the
-MAIN laptop's `/model/onnx` on first use (same-origin as `VITE_API_URL`)
-and cache it -- there's currently no mechanism for a client to use a
-*different* local model than what the main server serves; that's a
-natural extension (see README's "Distributed architecture" section for
-what's built vs. not yet).
-
-## 8. Frontend environment variables (optional)
-
-`frontend/.env` (create if you need to override defaults):
-
-```env
-VITE_API_URL=http://localhost:3001
-```
-
-## 9. Verifying your setup
-
-```powershell
-curl http://127.0.0.1:8000/health
-curl http://127.0.0.1:3001/health
-```
-
-Both should return `{"status": "ok", ...}` / `{"gateway": "ok", ...}`. If
-`model_ready`/`onnx_ready` are `false`, you haven't trained a model yet —
-the app still runs, but `/process` and the webcam demo will report "no
-trained model found" until you do.
-
-## 10. Running tests
-
-```powershell
-# Python (backend) -- requires a working PyTorch install for the full
-# suite (model.py/train.py/dataset.py/infer.py/api.py tests); the
-# schema/extraction/notes/checkpoint-metadata/split/eval-metrics tests
-# are torch-free and will pass even without one
-cd ml_service
-pip install pytest
-pytest
-
-# Frontend
-cd frontend
-npm test               # vitest, single run (this is what `npm test` maps to)
-npx vitest             # watch mode, if you want it while developing
-npx tsc --noEmit -p tsconfig.app.json   # typecheck (catches issues vitest's own transform can miss)
-```
+Training/evaluation, dataset preparation and the end-to-end check are in
+DEVELOPER_GUIDE.md.

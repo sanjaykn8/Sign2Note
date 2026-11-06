@@ -1,4 +1,4 @@
-# Feature Schema v2 — `hand_body_face`
+# Feature Schema (v2 `hand_body_face`, legacy v1 `hand_only`)
 
 This is the canonical, single-source-of-truth description of what a
 "feature vector" is in Sign2Notes. It exists because the project runs the
@@ -26,45 +26,52 @@ dimension, or the normalization formula in one file, you must regenerate
 the fixture (`cd ml_service && python3 generate_crosscheck_fixture.py`)
 and re-run the frontend test** — if it fails, the two schemas drifted.
 
-## History
+## Schema versions
 
-Schema v1 (`hand_only`) was 2 hands × 21 landmarks × (x,y,z) = **126
-dims**, built from `mp.solutions.hands`. It's retired, not extended. v1
-`.npy` feature files are **numerically incompatible** with v2 and must
-never be silently mixed in — `assert_feature_dim()` /
-`assertFeatureDim()` raise a clear, actionable error (naming the 126-dim
-case specifically) instead of a downstream shape-mismatch crash three
-layers away. See `ARCHITECTURE.md`'s changelog for v1's era; the 83.5%
-validation-accuracy result referenced by earlier project docs was
-measured against v1 (hand-only) features and should be labeled as such
-wherever it's cited, not silently reused as if it applied to v2.
+| Version | Type | Dims | Status |
+|---|---|---|---|
+| `2.0` | `hand_body_face` | 285 | current; everything new is trained on it |
+| `1.0` | `hand_only` | 126 | legacy; only to serve/compare the old model in `models/sign_recog` |
 
-There's also a real reason `mp.solutions.hands` had to go regardless of
-the schema change: it doesn't exist in current `mediapipe` releases —
-`pip install mediapipe` today ships Tasks-API-only, no `mp.solutions`.
-`requirements.txt`'s unpinned `mediapipe>=0.10.0` meant `feature_extraction.py`
-would crash on import against a fresh install. Migrating to the Tasks API
-(`HolisticLandmarker`) fixes this as a side effect of the v2 schema work.
+**v1 layout** (reproduced from the original extractor, git `b6a11c7`): two
+21×(x,y,z) hand slots filled in MediaPipe **detection order** (slot 0 =
+first detected hand), not by handedness. `feature_schema.LEGACY_*`,
+`build_legacy_v1_vector()`; Python extraction for v1 uses the original
+`mp.solutions.hands` settings (model_complexity 0, max 2 hands).
 
-## Detector: one `HolisticLandmarker` call, not three separate detectors
+v1 and v2 are never mixed: every checkpoint records
+`feature_schema_version`; the API extracts uploads in the served model's
+schema and rejects keypoints of another dimension; feature directories
+carry `feature_meta.json`; `assert_feature_dim(..., expected_dim=...)`
+fails loudly on a mismatch.
 
-Both languages use MediaPipe's Tasks-API **`HolisticLandmarker`** —
-confirmed present in both the installed Python `mediapipe` package and the
-pinned npm package (`@mediapipe/tasks-vision@1.0.1`, checked against its
-shipped `.d.ts`) — rather than running separate `HandLandmarker` +
-`PoseLandmarker` + `FaceLandmarker` instances. Two concrete reasons:
+**Browser → v1** (`legacyV1FromV2` / `legacy_v1_from_v2`): the browser
+only runs Holistic, so for a v1 model it packs the detected hands into the
+v1 slots in (left, right) order, skipping a missing hand. One visible hand
+→ slot 0, which is what v1 produced for one-handed signing; with two hands
+v1's order was arbitrary, so this is an approximation.
 
-1. **Handedness is solved by construction.** `HolisticLandmarker` reports
-   `left_hand_landmarks` / `right_hand_landmarks` (Python) and
-   `leftHandLandmarks` / `rightHandLandmarks` (JS) directly, resolved from
-   its own body tracking. Schema v1 ordered hands by "whichever MediaPipe
-   detected first," which is not the same thing as which hand is actually
-   left or right — that ambiguity doesn't exist in v2 at all, because the
-   API itself tells you.
-2. **One coordinate frame.** Hand, pose, and face landmarks from one
-   `HolisticLandmarker` call are guaranteed to come from the same frame's
-   single detection pass, rather than three independent detectors
-   potentially disagreeing about where the person is.
+The 83.5 % figure quoted in older docs belongs to the v1 model trained on
+a random split of all clips; it is not a v2 or official-split result.
+
+## Detector
+
+Python and browser run the same MediaPipe Holistic graph, through
+different APIs:
+
+| | API | Why |
+|---|---|---|
+| Python (training, uploads) | `mediapipe.solutions.holistic` (classic), `model_complexity=1`, `refine_face_landmarks=False`, tracking per video | The Tasks `HolisticLandmarker` in mediapipe 0.10.21 hard-crashes the process on FDMSE-ISL clips (`packet.cc ... The packet is empty`), reproduced in VIDEO and IMAGE mode. Selectable with `HOLISTIC_BACKEND=tasks`. |
+| Browser (live modes) | `@mediapipe/tasks-vision` `HolisticLandmarker` | No such crash; runs in WASM/GPU |
+
+Both resolve left/right hands from the body pose (no detection-order
+guessing) and use the same landmark numbering (21 per hand, 33 pose,
+468 face — Tasks adds 10 iris points at 468–477, which the schema does
+not use). Numeric outputs of the two implementations are close but not
+identical — a documented train/serve approximation for the live modes.
+Uploads are extracted with the same backend as training. The backend used
+is recorded in each feature directory's `feature_meta.json`
+(`mediapipe_api`).
 
 ## Coordinate system
 
@@ -209,35 +216,20 @@ Solved by the detector, not by post-processing (see "Detector" above) —
 
 ## Frame sampling, padding, temporal window length
 
-Unchanged from schema v1 — nothing in this audit showed a concrete reason
-to change `frame_skip`, sliding-window stride, or `max_len` handling, so
-they're preserved as-is (see `feature_extraction.py`'s CLI flags and
-`ARCHITECTURE.md`'s inference-pipeline section for the current values).
-Only the per-frame vector's *contents* changed (126 → 285 dims); the
-*temporal* pipeline around it (windowing, Viterbi decoding for uploaded
-video, stability gating for live webcam) is schema-agnostic and required
-no changes.
+- Training: FDMSE-ISL clips are 60 fps; `frame_skip=8` → 7.5 samples/s;
+  clips are ~20–35 samples, zero-padded at the end to `max_len=64`, then
+  normalized over the padded array.
+- Uploads: `frame_skip = round(fps / 7.5)` so any frame rate is sampled at
+  the training rate; windows of 24 real samples (stride 4) padded to 64.
+- Browser: one sample every `1000 / sample_hz` ms (133 ms); the buffer
+  keeps the last 24 samples, padded to 64.
 
-## Verified against the installed SDKs, not assumed
+## Verified against the installed SDKs
 
-Both of the following were checked against the actual installed
-packages while writing this schema, not recalled from memory:
-
-- `mediapipe==0.10.33` (Python): `mp.solutions` does not exist;
-  `mediapipe.tasks.python.vision.HolisticLandmarker` does, and its result
-  dataclass (`HolisticLandmarkerResult`) has `left_hand_landmarks`,
-  `right_hand_landmarks`, `pose_landmarks`, `face_landmarks` fields
-  (confirmed by reading `holistic_landmarker.py`'s source directly).
-- `@mediapipe/tasks-vision@1.0.1` (npm, the version pinned in
-  `frontend/package.json`): its shipped `vision.d.ts` declares
-  `HolisticLandmarker`, `HolisticLandmarkerOptions`, and
-  `HolisticLandmarkerResult` with `leftHandLandmarks`,
-  `rightHandLandmarks`, `poseLandmarks`, `faceLandmarks` fields
-  (confirmed by unpacking the actual npm tarball and grepping its type
-  declarations).
-
-Model asset (the `.task` bundle `HolisticLandmarker` loads) is fetched
-from Google's model CDN at first use, same pattern as v1's
-`hand_landmarker.task` — see `TROUBLESHOOTING.md` for the exact URL and
-`ARCHITECTURE.md`'s "Model download / cache" section for what is and
-isn't cached locally after that first fetch.
+- `mediapipe==0.10.21` (Python, the pinned version): provides both
+  `mediapipe.solutions.holistic` / `.hands` and the Tasks
+  `HolisticLandmarker`; the Tasks one crashes as described above. Later
+  releases (e.g. 0.10.33) removed `mediapipe.solutions`.
+- `@mediapipe/tasks-vision@1.0.1` (npm): `HolisticLandmarker` with
+  `leftHandLandmarks`, `rightHandLandmarks`, `poseLandmarks`,
+  `faceLandmarks`.

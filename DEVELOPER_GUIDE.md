@@ -1,216 +1,178 @@
 # Developer Guide
 
-This is a codebase tour for someone picking up this project — what each
-file does, where to make common changes, and how the test suite is
-organized. For install steps see `SETUP.md`; for how the pieces fit
-together see `ARCHITECTURE.md`.
+How to work on, train, test and maintain Sign2Notes. Install steps are in
+SETUP.md; the design is in ARCHITECTURE.md. All Python commands use the
+ML venv: `ml_service\venv\Scripts\python` (written `py` below for brevity:
+`Set-Alias py ml_service\venv\Scripts\python` in PowerShell, run from the
+repo root).
 
 ## Repository layout
 
 ```text
-Sign2Note/
-├── ml_service/           # Python: feature extraction, training, inference, API
-│   ├── api.py             # FastAPI app — all HTTP endpoints
-│   ├── infer.py           # sliding-window inference, LLM/template notes+transcripts
-│   ├── inference_viterbi.py  # Viterbi smoothing (flat list + timestamped events)
-│   ├── notes_generator.py    # deterministic template engine + LLM prompts (notes: 3 styles; transcript: 1)
-│   ├── feature_schema.py     # canonical hand+body+face feature schema (see FEATURE_SCHEMA.md)
-│   ├── feature_extraction.py # video -> keypoints, MediaPipe HolisticLandmarker (WLASL legacy + FDMSE-ISL)
-│   ├── generate_crosscheck_fixture.py # regenerates the Python<->TS golden-vector test fixture
-│   ├── build_index.py        # metadata -> data/index.csv + config/vocab.json
-│   ├── checkpoint_meta.py    # torch-free: vocab hashing, checkpoint metadata, compatibility checks
-│   ├── split_utils.py        # torch-free: official/random train-val split, test-split resolution
-│   ├── eval_metrics.py       # torch-free: Top-k accuracy, F1, confusion matrix (+ PNG)
-│   ├── evaluate.py           # official TEST-split evaluation (needs torch)
-│   ├── dataset.py            # PyTorch Dataset, with augmentation
-│   ├── model.py               # TemporalCNN (default) + optional CNNBiLSTM
-│   ├── train.py                # training loop, ONNX export
-│   ├── requirements.txt
-│   ├── .env.example
-│   └── tests/                  # pytest suite (see "Testing" below for torch-free vs. torch-dependent)
-├── backend/                # Node/Express gateway (proxies to ml_service)
-│   └── server.js
-├── frontend/                # React (Vite) app
-│   └── src/
-│       ├── pages/Index.tsx     # video upload page (Mode 1)
-│       ├── pages/Webcam.tsx    # live webcam session page (Mode 2)
-│       ├── pages/LiveTranscription.tsx # live transcription page (Mode 3)
-│       ├── lib/api.ts            # backend HTTP client
-│       ├── lib/webcamPipeline.ts # pure logic: keypoint buffering, smoothing state machine
-│       ├── lib/useSignRecognitionSession.ts # shared hook: camera+model+recognition, used by Webcam.tsx and LiveTranscription.tsx
-│       ├── lib/featureSchema.ts  # canonical hand+body+face feature schema (mirrors ml_service/feature_schema.py)
-│       ├── lib/onnxSession.ts    # onnxruntime-web wrapper
-│       ├── lib/holisticLandmarker.ts # @mediapipe/tasks-vision HolisticLandmarker wrapper
-│       ├── lib/notesExport.ts    # client-side Markdown/Text/PDF/DOCX export
-│       ├── lib/markdown.ts       # Markdown-subset -> HTML renderer, shared by NotesPanel/ResultsPanel
-│       ├── components/NotesPanel.tsx # Preview -> Edit -> Export panel (used by all 3 modes)
-│       ├── components/           # other shared UI (PrivacyBanner, ResultsPanel, ...)
-│       ├── lib/__tests__/        # vitest suite (pure logic)
-│       └── pages/__tests__/      # vitest suite (rendered-component tests)
-├── data/                    # FDMSE-ISL dataset + metadata (see README.md)
-├── config/vocab.json         # label2id/id2label, written by build_index.py
-├── models/sign_recog_v2/     # checkpoints + ONNX export (gitignored, generated)
-├── README.md
-├── ARCHITECTURE.md
-├── FEATURE_SCHEMA.md
-├── SETUP.md
-├── TROUBLESHOOTING.md
-├── PRIVACY.md
-└── DEVELOPER_GUIDE.md (this file)
+ml_service/
+  api.py                 FastAPI: recognition (/recognize, /recognize/video, /model/*) and
+                         language generation (/notes, /transcript); /process combines them
+  infer.py               model loading (per-file caches, ONNX↔checkpoint checks), windowed
+                         inference, Viterbi events, LLM calls + validation + fallback
+  feature_schema.py      canonical feature layouts: v2 hand+body+face (285), legacy v1 (126)
+  feature_extraction.py  video → .npy features (classic Holistic for v2; original Hands for v1)
+  notes_generator.py     versioned prompts (concise/detailed/academic, transcript) + deterministic fallbacks
+  inference_viterbi.py   Viterbi decoding (gloss list and timestamped events)
+  dataset.py, model.py, train.py, evaluate.py, eval_metrics.py, split_utils.py, checkpoint_meta.py
+  build_index.py         metadata CSV + features → index CSV + vocabulary JSON
+  dataset_audit.py       dataset checks → reports/dataset_audit.{md,json}
+  tools/e2e_check.py     end-to-end check against running services
+  tests/                 pytest (167 tests)
+backend/server.js        Express gateway (auth, limits, timeouts, JSON errors); test/ = node:test
+frontend/src/
+  pages/Index.tsx, Webcam.tsx, LiveTranscription.tsx    the three modes
+  lib/serverConfig.ts    server URL/token, apiFetch (timeouts, bounded retries)
+  lib/api.ts             typed client for every endpoint
+  lib/useSignRecognitionSession.ts   live pipeline (local/server recognizer selection)
+  lib/webcamPipeline.ts  KeypointBuffer, SessionSmoother (pure, unit-tested)
+  lib/featureSchema.ts   TS twin of feature_schema.py (golden-vector cross-check test)
+  lib/notesExport.ts, lib/markdown.ts   shared Markdown parser; MD/TXT/PDF/DOCX export
+  components/            NotesPanel, ResultsPanel, GlossEditor, ConnectionStatus, RecognizerStatus, ...
+reports/                 dataset audit, evaluation reports
+models/, data/           git-ignored (models, dataset, features, temp files)
 ```
 
-## Common tasks
+`frontend/src/App.js`, `src/index.js` and `frontend/react-app/` are
+leftovers of an older Create-React-App scaffold; they are not part of the
+Vite build (`index.html` → `src/main.tsx`) and were left untouched.
 
-### Adding a new note-generation style
+## Training and evaluating a model
 
-Edit `_SECTION_KEYWORDS`/`style_text` maps in
-`ml_service/notes_generator.py` — both `template_notes_from_tokens()` and
-`build_notes_prompt()` read from small keyword/style dictionaries at the
-top of the file, so adding a style or a new section-keyword category is a
-localized change.
-
-### Adding a new LLM provider
-
-`infer.py`'s `LLM_PROVIDER`/`LLM_MODEL`/`LLM_BASE_URL` are just three env
-vars feeding one OpenAI-compatible client — any provider that speaks
-`/v1/chat/completions` (which is most local LLM servers at this point)
-works without code changes, just a different `LLM_BASE_URL`. If you need a
-provider with a genuinely different API shape, add a branch in
-`_get_llm_client()`/`generate_llm_notes()`/`generate_llm_transcript()`.
-
-### Changing the confidence threshold behavior
-
-See the table in `ARCHITECTURE.md`'s "Confidence handling reference" —
-there are two independent knobs (upload vs. webcam) by design; changing
-one doesn't affect the other.
-
-### Adding a field to the `/process` response
-
-Add it in `ml_service/api.py`'s return dict, then add the corresponding
-field to `ProcessResult` in `frontend/src/lib/api.ts` (TypeScript won't
-stop you from omitting this, but `ResultsPanel.tsx` won't see the new
-field until you thread it through).
-
-### Modifying the live recognition pipeline
-
-Almost everything you'd want to touch is in
-`frontend/src/lib/webcamPipeline.ts` and `frontend/src/lib/featureSchema.ts`,
-which have **zero browser API dependencies** — plain functions/classes
-operating on typed arrays, specifically so they can be unit tested
-without a browser or camera. If you change anything here (buffer size,
-smoothing rule, normalization), run `npm test` in `frontend/` and update
-`src/lib/__tests__/webcamPipeline.test.ts` (session/buffer logic) and
-`src/lib/__tests__/featureSchema.test.ts` (feature vector/normalization
-logic) to match. The browser-touching code
-(`onnxSession.ts`, `holisticLandmarker.ts`,
-`useSignRecognitionSession.ts`, `Webcam.tsx`, `LiveTranscription.tsx`)
-should stay as thin wrappers/UI around these modules, not grow additional
-logic — `useSignRecognitionSession.ts` in particular is the one place
-that owns camera/model lifecycle and the detection loop, shared by both
-pages, so a fix there fixes both instead of needing to be duplicated.
-
-**Important:** `featureSchema.ts`'s `buildFeatureVector()` and
-`normalizeSequence()` must stay numerically identical to their Python
-counterparts (`feature_schema.py: build_feature_vector()` and
-`normalize_sequence()`) — if you change the Python side's preprocessing,
-mirror the change here too, regenerate the cross-check fixture
-(`cd ml_service && python3 generate_crosscheck_fixture.py`), and confirm
-`featureSchema.crosscheck.test.ts` still passes. Silently drifting here
-doesn't error — it produces wrong-but-plausible-looking predictions, which
-is much harder to notice than a crash.
-
-## Testing
-
-### Python (`ml_service/tests/`, pytest)
+The official FDMSE-ISL splits are used as-is (train → training, val →
+checkpoint selection/early stopping, test → final evaluation only).
+Nothing below reads test rows before `evaluate.py`.
 
 ```powershell
-cd ml_service
-pytest -v
+# 0. Audit the dataset (read-only)
+py ml_service/dataset_audit.py --feature_dir data/features_v2
+
+# 1. Extract schema-v2 features. Resumable: existing correct files are skipped.
+#    ~4 h for all 40,033 clips on the dev laptop CPU with 12 workers, ON MAINS POWER.
+py ml_service/feature_extraction.py --metadata_csv data/data_meta/metadata.csv --out_dir data/features_v2 --workers 12 --splits train,val
+py ml_service/feature_extraction.py --metadata_csv data/data_meta/metadata.csv --out_dir data/features_v2 --workers 12 --splits test
+#    Failures (unreadable videos) are listed in data/features_v2/extraction_failures.csv.
+
+# 2. Index + vocabulary for v2 (separate files: the legacy data/index.csv and
+#    config/vocab.json belong to the legacy model and are kept unchanged)
+py ml_service/build_index.py --metadata_csv data/data_meta/metadata.csv --feature_dir data/features_v2 --out_csv data/index_v2.csv --vocab_json config/vocab_v2.json --min_samples 10
+#    Smaller vocabulary for a quick experiment: add --max_classes 400 (writes the
+#    400 most frequent classes; use different --out_csv/--vocab_json names).
+
+# 3. Train into a CANDIDATE directory (the API never serves it automatically)
+py ml_service/train.py --index_csv data/index_v2.csv --vocab_json config/vocab_v2.json --feature_dir data/features_v2 --out_dir models/sign_recog_v2_candidate/checkpoints --epochs 40 --patience 8 --batch_size 64 --preload
+
+# 3b. Hand-only ablation on the SAME split/protocol (for the baseline comparison;
+#     produces a deliberately non-servable checkpoint)
+py ml_service/train.py --index_csv data/index_v2.csv --vocab_json config/vocab_v2.json --feature_dir data/features_v2 --feature_groups left_hand,right_hand --out_dir models/ablation_hands_only/checkpoints --epochs 40 --patience 8 --batch_size 64 --preload
+
+# 3c. Optional CNN+BiLSTM experiment (keep TemporalCNN unless this is measurably better)
+#     add: --architecture cnn_bilstm --out_dir models/exp_cnn_bilstm/checkpoints
+
+# 4. Evaluate: validation and test reported separately
+py ml_service/evaluate.py --checkpoint models/sign_recog_v2_candidate/checkpoints/best.pt --index_csv data/index_v2.csv --feature_dir data/features_v2 --vocab_json config/vocab_v2.json --splits val,test --out_dir reports/eval_v2
+py ml_service/evaluate.py --checkpoint models/ablation_hands_only/checkpoints/best.pt --index_csv data/index_v2.csv --feature_dir data/features_v2 --vocab_json config/vocab_v2.json --splits val,test --out_dir reports/eval_hands_only
 ```
 
-Two groups, because of a real environment constraint hit while building
-this: `model.py`/`train.py`/`dataset.py`/`infer.py`/`api.py` all import
-`torch`, and PyTorch could not be installed in the sandbox this project
-was largely built in (disk-constrained container; the CUDA dependency
-wheels alone need more space than was available, and no CPU-only wheel
-index was reachable). So:
+`train.py` writes `best.pt` (best val accuracy), `demo.pt` (last epoch),
+`train_history.json`, `../sign_recog.onnx` (from `best.pt`, with a
+PyTorch↔ONNX parity check that fails the run if they diverge) and
+`../sign_recog.json` (metadata). Every checkpoint records: model version,
+architecture, feature schema version, input dim, class count, `label2id`,
+vocabulary hash, training config (index, vocabulary, feature extraction
+backend/frame_skip, whether the official split was used), best validation
+accuracy. `evaluate.py` writes per split `results.json` (Top-1/3/5,
+macro-F1, weighted F1, per-class precision/recall/F1, class sample
+counts), `results.txt`, `confusion_matrix.npz` (`--confusion_matrix_png`
+for an image).
 
-- **Torch-free, verified working in that environment** --
-  `test_feature_schema.py`, `test_feature_extraction.py`,
-  `test_notes_generator.py`, `test_viterbi.py`, `test_checkpoint_meta.py`,
-  `test_split_utils.py`, `test_eval_metrics.py`. These cover the
-  canonical hand+body+face feature schema (missing-landmark behavior,
-  normalization, dimension guards), the Holistic-based extraction glue,
-  both note-generation output layers (structured notes in three styles,
-  the natural-language transcript) with their deterministic fallbacks,
-  Viterbi decoding, checkpoint metadata assembly/compatibility checking,
-  train/val/test split resolution (including the official-split path and
-  its random-split fallback), and evaluation metrics (Top-k accuracy,
-  macro/weighted F1, per-class metrics, confusion matrix -- including a
-  real rendered PNG, checked via its actual magic bytes, not just "didn't
-  throw").
-- **Written and reviewed, not executed in that environment** --
-  `test_dataset.py`, `test_api.py`, `test_normalization.py`,
-  `test_infer_notes.py` (all import something that imports `torch`).
-  Syntax-checked (`python -m py_compile`) and statically checked for
-  undefined names (`python -m pyflakes *.py tests/*.py`) -- the latter
-  is worth running after any change here, since it catches real bugs a
-  syntax check alone won't (e.g. a function call left referencing a name
-  that was renamed elsewhere). Run the full suite yourself on a machine
-  with PyTorch before trusting these.
+CPU training: the TemporalCNN is small; `--preload` loads ~1.5 GB of
+features into RAM and avoids per-sample file reads. `--threads N` caps
+PyTorch threads.
 
-### Frontend (`frontend/src/`, vitest)
+### Replacing the served model safely
+
+1. Train into `models/<candidate>/` and evaluate it (above).
+2. Try it without moving files: start the ML service with
+   `$env:MODEL_PATH="models\sign_recog_v2_candidate\checkpoints\best.pt"`
+   (the ONNX next to it is used automatically) and check `/health` and
+   `tools/e2e_check.py`.
+3. Promote: rename `models/sign_recog_v2_candidate` → `models/sign_recog_v2`
+   (rename any existing `sign_recog_v2` to `sign_recog_v2_previous` first).
+   The ML service picks up the new file on the next request; browsers pick
+   up the new ONNX on reload.
+4. Browsers with the old model cached reload `/model/meta` on page load;
+   an incompatible schema is refused, never guessed.
+
+### Rolling back
+
+- Model: set `MODEL_PATH` to the previous checkpoint (e.g.
+  `models\sign_recog\checkpoints\best.pt` for the legacy hand-only model,
+  or `models\sign_recog_v2_previous\...`) and restart the ML service, or
+  rename the directories back. Nothing is deleted by training.
+- Code: `git checkout baseline-before-stabilization` (the state before this
+  pass) or any earlier commit; the stabilization work is on branch
+  `stabilization-and-completion`.
+
+## End-to-end check
+
+With the three services running:
 
 ```powershell
-cd frontend
-npm test
+py ml_service/tools/e2e_check.py --gateway http://127.0.0.1:3001 --signer s0004 --n_clips 6 --n_single 5 --out reports/e2e_check.json
 ```
 
-- `lib/__tests__/webcamPipeline.test.ts` -- the session-specific logic
-  that's actually still in `webcamPipeline.ts` post-schema-v2 (the
-  `KeypointBuffer` ring/padding behavior, `SessionSmoother`'s three-zone
-  confidence gating and commit/reject/stability state machine, undo
-  behavior).
-- `lib/__tests__/featureSchema.test.ts` -- the canonical feature schema's
-  own TypeScript-side unit tests (missing-landmark cases, dimension
-  bookkeeping, normalization, the pose-visibility z-score exclusion).
-- `lib/__tests__/featureSchema.crosscheck.test.ts` -- the cross-language
-  golden-vector test: feeds a fixture generated BY
-  `ml_service/generate_crosscheck_fixture.py` through this file's
-  `buildFeatureVector()`/`normalizeSequence()` and asserts the output
-  matches Python's, to 3-4 decimal places. Regenerate the fixture and
-  re-run this test after touching either side's schema logic.
-- `lib/__tests__/notesExport.test.ts` -- Markdown/plain-text formatting,
-  the inline bold/italic tokenizer, and real DOCX generation (verified
-  via the actual ZIP magic bytes on `Packer.toBuffer()`'s output, not
-  just "the promise resolved").
-- `pages/__tests__/LiveTranscription.test.tsx` -- a real rendered-
-  component test (mocking only the camera/model layer via
-  `useSignRecognitionSession`) covering the Stop & Generate state
-  machine: the duplicate-request guard on a simulated rapid double-click,
-  the empty-session guard, and the error/retry-with-preserved-glosses
-  path.
+Uploads real test-signer clips, recognizes a video stitched from several
+clips (known order; compares old vs new windowing, reports edit distance
+and latency), and generates notes in all styles plus a transcript.
 
-### What's NOT covered by automated tests
+## Tests
 
-Neither the webcam nor the live-transcription feature has been run in an
-actual browser with an actual camera as part of this work -- both are
-type-checked (`npx tsc -p tsconfig.app.json --noEmit`) and confirmed to
-build successfully (`npm run build`), but the real runtime combination of
-`getUserMedia`/`getDisplayMedia`, MediaPipe's WASM Holistic tracking, and
-ONNX Runtime Web's WASM inference together has not been exercised -- that
-needs a real browser + camera, unavailable in the environment this was
-built in. See "Known Limitations" in `README.md`.
+| Suite | Command | Count |
+|---|---|---|
+| ML (pytest) | `cd ml_service; .\venv\Scripts\python -m pytest -q` | 167 |
+| Gateway (node:test) | `cd backend; npm test` | 4 |
+| Frontend (vitest) | `cd frontend; npx vitest run` | 82 |
+| Type check / build | `cd frontend; npx tsc --noEmit -p tsconfig.app.json; npx vite build` | — |
 
-## Style/conventions
+What the tests cover: feature schema (dims, handedness, missing landmarks,
+normalization, Python↔TS golden vector), legacy-schema conversion, split
+integrity and alignment, label mapping, checkpoint metadata and
+self-consistency, ONNX↔PyTorch parity, per-checkpoint caching, single and
+long (streamed) window inference, Viterbi, train+evaluate end to end on
+synthetic data, API validation (empty/oversized/wrong-type uploads,
+wrong-dimension keypoints, missing model, all styles), LLM fallback
+(unreachable server, fake server, output validation), gateway auth/
+timeouts/limits, frontend smoothing, buffers, server config/timeouts/
+retries, DOCX content, Markdown parsing, gloss editing/undo, upload-result
+regeneration, Live Transcription stop/generate/retry.
 
-- Python: standard library + the packages in `requirements.txt`, no extra
-  formatting tooling enforced.
-- TypeScript: `tsconfig.app.json` has `strictNullChecks: false` and
-  `noImplicitAny: false` (inherited from the original project scaffold) —
-  new code should still prefer explicit types where practical, but the
-  compiler won't enforce it.
-- Keep browser-API-touching code separate from pure logic wherever
-  feasible (see `webcamPipeline.ts` above) — it's the difference between
-  code you can unit test in milliseconds and code you can only check by
-  hand in a real browser.
+Not covered by automated tests (needs hardware or a person): real camera
+and screen capture in a browser, MediaPipe WASM + onnxruntime-web together
+in a browser, two physical devices over a LAN, a real local LLM.
+
+## Common changes
+
+- **New notes style**: add a prompt builder and a template renderer in
+  `notes_generator.py`, register both, add a `PROMPT_VERSIONS` entry, add
+  the option to the style selects in the frontend.
+- **Changing a prompt**: bump its `PROMPT_VERSIONS` value; keep the shared
+  grounding rules.
+- **New feature schema**: add constants + builder in `feature_schema.py`
+  and `featureSchema.ts`, register in `SCHEMA_DIMS` / `featureDimForSchema`,
+  regenerate the golden fixture (`generate_crosscheck_fixture.py`), and
+  give the extractor a new output directory. Never reuse a schema version.
+- **New API field**: add it to the FastAPI response and the TS interface
+  in `lib/api.ts`; keep existing fields (clients may depend on them).
+
+## Conventions
+
+- Recognition never generates text; language generation never sees video
+  or keypoints.
+- Never present validation numbers as test numbers; never let test rows
+  influence training or model selection.
+- Pure logic stays separate from browser APIs so it can be unit-tested.

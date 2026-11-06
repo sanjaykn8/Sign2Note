@@ -8,7 +8,8 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Starting ML service (port 8000)..."
 cd "$ROOT/ml_service"
-python3 -m uvicorn api:app --host 127.0.0.1 --port 8000 &
+PY="$ROOT/ml_service/venv/bin/python"; [ -x "$PY" ] || PY=python3
+"$PY" -m uvicorn api:app --host 127.0.0.1 --port 8000 &
 ML_PID=$!
 
 echo "Starting backend gateway (port 3001)..."
@@ -23,7 +24,7 @@ FE_PID=$!
 
 echo ""
 echo "All services started."
-echo "  Frontend -> http://localhost:8080  (/ for upload, /webcam for live session)"
+echo "  Frontend -> http://localhost:8080  (/ upload, /webcam live webcam, /live-transcription)"
 echo "  Backend  -> http://localhost:3001"
 echo "  ML API   -> http://localhost:8000"
 echo ""

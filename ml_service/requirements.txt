@@ -2,7 +2,11 @@
 torch>=2.0.0
 torchvision
 # Feature extraction
-mediapipe>=0.10.0
+# Pinned: 0.10.21 still ships mediapipe.solutions (classic Holistic + Hands),
+# which feature_extraction.py uses because the Tasks HolisticLandmarker
+# crashes in Python on this setup, and which the legacy v1 model's
+# extractor needs. Later releases removed mediapipe.solutions.
+mediapipe==0.10.21
 opencv-python
 numpy
 # Data
@@ -29,3 +33,7 @@ openai>=1.0.0
 # CONFIDENCE_THRESHOLD without having to export env vars manually.
 # Both api.py and infer.py degrade gracefully if this isn't installed.
 python-dotenv
+
+# Tests / tools
+pytest
+httpx
