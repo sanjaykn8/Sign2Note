@@ -6,6 +6,17 @@ commit (`7a77030`, "live base") this pass started from.
 
 ## Stabilization and completion pass — branch `stabilization-and-completion`
 
+### Python environment: global Python 3.11 instead of a venv
+
+The isolated `ml_service/venv` was removed at the owner's request; the ML
+service, extraction and training run on the global Python 3.11 (which has
+PyTorch with CUDA). `requirements.txt` now pins `numpy>=1.24,<2` and
+`protobuf>=4.25.3,<5`, the versions mediapipe 0.10.21 requires; with them
+the global interpreter imports mediapipe, TensorFlow 2.17 and torch
+2.14+cu130 together. Verified: all 167 ML tests pass on the global
+interpreter with these pins, and one FDMSE-ISL clip extracted there is
+identical to the feature file produced earlier in the venv.
+
 ### Baseline found (before any change)
 
 | Area | Baseline state | How verified |

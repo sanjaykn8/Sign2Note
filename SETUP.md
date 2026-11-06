@@ -1,8 +1,8 @@
 # Setup
 
 All commands are run from the repository root unless a `cd` is shown.
-PowerShell syntax; on macOS/Linux use `ml_service/venv/bin/python` and
-`run.sh`.
+PowerShell syntax; `py -3.11` is the global Python 3.11 (on macOS/Linux use
+`python3.11` and `run.sh`).
 
 ## Prerequisites
 
@@ -14,20 +14,28 @@ PowerShell syntax; on macOS/Linux use `ml_service/venv/bin/python` and
 
 ## 1. ML service (Python)
 
-Use a dedicated virtual environment. On the development laptop the global
-Python 3.11 had TensorFlow built for NumPy 1.x next to NumPy 2.x, which
-makes `import mediapipe` fail (MediaPipe imports TensorFlow if present); an
-isolated venv avoids that entirely.
+Install into the global Python 3.11. For GPU training install the CUDA
+build of PyTorch from pytorch.org first; otherwise `requirements.txt` pulls
+the CPU build.
 
 ```powershell
-py -3.11 -m venv ml_service\venv
-ml_service\venv\Scripts\python -m pip install --upgrade pip
-# CPU-only PyTorch (smaller download). For CUDA, install the matching wheel from pytorch.org instead.
-ml_service\venv\Scripts\python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-ml_service\venv\Scripts\python -m pip install -r ml_service\requirements.txt
+py -3.11 -m pip install -r ml_service\requirements.txt
 ```
 
-Check: `ml_service\venv\Scripts\python -c "import torch, mediapipe; print(mediapipe.__version__)"` → `0.10.21`.
+`requirements.txt` pins **NumPy < 2** and **protobuf < 5**, which
+mediapipe 0.10.21 requires. With NumPy 2.x / protobuf 6 installed,
+`import mediapipe` fails, and if TensorFlow is installed too its import
+fails first (`_pywrap_checkpoint_reader`, `_ARRAY_API`). TensorFlow 2.17,
+PyTorch 2.x, OpenCV 4.11 and JAX 0.4 all work with NumPy 1.26. If another
+project needs NumPy 2, give one of the two its own environment.
+
+Check:
+
+```powershell
+py -3.11 -c "import torch, mediapipe, numpy; print(mediapipe.__version__, numpy.__version__, torch.cuda.is_available())"
+```
+
+Expected: `0.10.21 1.26.x True` (`False` without a usable NVIDIA GPU; training then runs on CPU).
 
 Configuration: copy `ml_service/.env.example` to `ml_service/.env` and
 adjust. Important variables:
@@ -44,7 +52,7 @@ adjust. Important variables:
 | `LLM_TIMEOUT`, `LLM_MAX_RETRIES` | 90 s, 1 | Bounded LLM calls (then deterministic fallback) |
 | `HOLISTIC_BACKEND` | `solutions` | Python landmark extractor (`tasks` crashes on 0.10.21/Windows) |
 
-Start: `cd ml_service; .\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8000`
+Start: `cd ml_service; py -3.11 -m uvicorn api:app --host 127.0.0.1 --port 8000`
 
 Keep `--host 127.0.0.1`: only the gateway talks to the ML service.
 
@@ -130,7 +138,7 @@ shows which model is served (`1.0` = legacy hand-only, `2.0` = hand+body+face).
 ## 6. Tests
 
 ```powershell
-cd ml_service; .\venv\Scripts\python -m pytest -q        # 167 tests
+cd ml_service; py -3.11 -m pytest -q                    # 167 tests (needs pytest, httpx)
 cd backend; npm test                                     # 4 tests
 cd frontend; npx vitest run                              # 82 tests
 cd frontend; npx tsc --noEmit -p tsconfig.app.json; npx vite build

@@ -53,9 +53,8 @@ Prerequisites: Python 3.11, Node.js 20+ (tested with 22), the FDMSE-ISL
 dataset if you want to train. Run from the repository root.
 
 ```powershell
-# 1. ML service environment (isolated venv; see SETUP.md for why)
-py -3.11 -m venv ml_service\venv
-ml_service\venv\Scripts\python -m pip install -r ml_service\requirements.txt
+# 1. Python packages (global Python 3.11; see SETUP.md for the NumPy/protobuf pins)
+py -3.11 -m pip install -r ml_service\requirements.txt
 
 # 2. Node dependencies
 cd backend;  npm install; cd ..
@@ -65,7 +64,7 @@ cd frontend; npm install; cd ..
 Start the three services in three terminals:
 
 ```powershell
-cd ml_service; .\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8000
+cd ml_service; py -3.11 -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
 ```powershell

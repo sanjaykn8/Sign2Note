@@ -13,7 +13,7 @@ This is NOT a substitute for the official-split evaluation (evaluate.py);
 it checks that the deployed pipeline works on real video and measures it.
 
 Usage (from the repo root, services running):
-    ml_service/venv/Scripts/python ml_service/tools/e2e_check.py \\
+    py -3.11 ml_service/tools/e2e_check.py \\
         --gateway http://127.0.0.1:3001 --signer s0004 --n_clips 6 --out reports/e2e_legacy.json
 """
 import argparse

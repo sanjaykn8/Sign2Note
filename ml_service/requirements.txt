@@ -7,8 +7,12 @@ torchvision
 # crashes in Python on this setup, and which the legacy v1 model's
 # extractor needs. Later releases removed mediapipe.solutions.
 mediapipe==0.10.21
+# mediapipe 0.10.21 requires NumPy < 2 and protobuf < 5. With NumPy 2.x or
+# protobuf 5+/6+ installed, `import mediapipe` fails (and if TensorFlow is in
+# the same environment, its import fails first with _pywrap_* errors).
+numpy>=1.24,<2
+protobuf>=4.25.3,<5
 opencv-python
-numpy
 # Data
 pandas
 tqdm

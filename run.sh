@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 
 echo "Starting ML service (port 8000)..."
 cd "$ROOT/ml_service"
-PY="$ROOT/ml_service/venv/bin/python"; [ -x "$PY" ] || PY=python3
+PY="${PYTHON:-python3.11}"; command -v "$PY" >/dev/null || PY=python3
 "$PY" -m uvicorn api:app --host 127.0.0.1 --port 8000 &
 ML_PID=$!
 

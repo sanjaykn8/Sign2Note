@@ -2,9 +2,9 @@
 
 How to work on, train, test and maintain Sign2Notes. Install steps are in
 SETUP.md; the design is in ARCHITECTURE.md. All Python commands use the
-ML venv: `ml_service\venv\Scripts\python` (written `py` below for brevity:
-`Set-Alias py ml_service\venv\Scripts\python` in PowerShell, run from the
-repo root).
+global Python 3.11 with `ml_service/requirements.txt` installed, written
+`py` below (the Windows launcher; if `py` defaults to another version, run
+`$env:PY_PYTHON="3.11"` first). Run from the repo root.
 
 ## Repository layout
 
@@ -90,7 +90,8 @@ macro-F1, weighted F1, per-class precision/recall/F1, class sample
 counts), `results.txt`, `confusion_matrix.npz` (`--confusion_matrix_png`
 for an image).
 
-CPU training: the TemporalCNN is small; `--preload` loads ~1.5 GB of
+Training uses CUDA automatically when `torch.cuda.is_available()` (with
+mixed precision; `--no_amp` disables it), otherwise CPU. The TemporalCNN is small; `--preload` loads ~1.5 GB of
 features into RAM and avoids per-sample file reads. `--threads N` caps
 PyTorch threads.
 
@@ -134,7 +135,7 @@ and latency), and generates notes in all styles plus a transcript.
 
 | Suite | Command | Count |
 |---|---|---|
-| ML (pytest) | `cd ml_service; .\venv\Scripts\python -m pytest -q` | 167 |
+| ML (pytest) | `cd ml_service; py -m pytest -q` | 167 |
 | Gateway (node:test) | `cd backend; npm test` | 4 |
 | Frontend (vitest) | `cd frontend; npx vitest run` | 82 |
 | Type check / build | `cd frontend; npx tsc --noEmit -p tsconfig.app.json; npx vite build` | — |

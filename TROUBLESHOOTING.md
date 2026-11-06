@@ -25,10 +25,11 @@ Connection settings on each device.
 
 ## `import mediapipe` fails (TensorFlow / NumPy / `_ARRAY_API` / `GetPrototype` errors)
 
-MediaPipe imports TensorFlow if it is installed in the same environment;
-a TensorFlow built for NumPy 1.x next to NumPy 2.x breaks that import. Use
-the isolated venv from SETUP.md (`ml_service\venv`), which contains no
-TensorFlow.
+mediapipe 0.10.21 needs NumPy < 2 and protobuf < 5, and it imports
+TensorFlow if TensorFlow is installed (TensorFlow 2.17 also needs NumPy < 2).
+Install the pinned versions:
+`py -3.11 -m pip install "numpy>=1.24,<2" "protobuf>=4.25.3,<5"`
+(or re-run `py -3.11 -m pip install -r ml_service\requirements.txt`).
 
 ## Python extraction crashes: `packet.cc ... Check failed: holder_ != nullptr The packet is empty`
 
