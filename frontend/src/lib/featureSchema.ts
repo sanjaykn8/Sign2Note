@@ -273,3 +273,46 @@ export function normalizeSequence(window: Float32Array, frames: number, dims = F
   }
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Legacy schema v1 ("hand_only", 126 dims) -- mirrors feature_schema.py's
+// LEGACY_* constants and legacy_v1_from_v2(). Only used when the server is
+// serving the old hand-only model (ModelMeta.feature_schema_version "1.0"),
+// so that model is fed vectors in ITS layout, never v2 vectors.
+// ---------------------------------------------------------------------------
+export const LEGACY_SCHEMA_VERSION = "1.0";
+export const LEGACY_FEATURE_DIM = 2 * HAND_FEATURE_DIM; // 126
+
+/** Feature dimension for a schema version this browser can produce, or null. */
+export function featureDimForSchema(version: string | undefined): number | null {
+  if (version === FEATURE_SCHEMA_VERSION) return FEATURE_DIM;
+  if (version === LEGACY_SCHEMA_VERSION) return LEGACY_FEATURE_DIM;
+  return null;
+}
+
+/**
+ * v2 vector -> approximate v1 vector: detected hands packed into the v1
+ * slots in (left, right) order, a missing hand skipped -- so one visible
+ * hand always lands in slot 0, as v1's detection-order layout produced for
+ * one-handed signing. Same rule as feature_schema.legacy_v1_from_v2().
+ */
+export function legacyV1FromV2(vec: Float32Array): Float32Array {
+  assertFeatureDim(vec.length, "legacyV1FromV2 input");
+  const out = new Float32Array(LEGACY_FEATURE_DIM);
+  let slot = 0;
+  for (const start of [0, HAND_FEATURE_DIM]) {
+    const hand = vec.subarray(start, start + HAND_FEATURE_DIM);
+    if (hand.some((v) => v !== 0)) {
+      out.set(hand, slot * HAND_FEATURE_DIM);
+      slot++;
+    }
+  }
+  return out;
+}
+
+/** Convert a canonical v2 frame vector into the given schema's layout. */
+export function toSchema(vec: Float32Array, version: string | undefined): Float32Array {
+  if (version === LEGACY_SCHEMA_VERSION) return legacyV1FromV2(vec);
+  if (version === FEATURE_SCHEMA_VERSION) return vec;
+  throw new FeatureSchemaError(`This browser cannot produce features for schema ${version ?? "(unknown)"}.`);
+}

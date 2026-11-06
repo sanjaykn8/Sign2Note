@@ -32,11 +32,31 @@ export { buildFeatureVector, FEATURE_DIM } from "./featureSchema";
  */
 export class KeypointBuffer {
   private frames: Float32Array[] = [];
-  constructor(private maxLen: number, private dims = FEATURE_DIM) {}
+  private windowFrames: number;
+  /**
+   * @param maxLen       model input length (frames after zero-padding)
+   * @param dims         per-frame feature dimension
+   * @param windowFrames how many REAL frames to keep (default: maxLen).
+   *   Training clips are ~20-35 sampled frames zero-padded to maxLen, so
+   *   keeping ~24 real frames and padding (instead of filling all 64 slots
+   *   with 8.5 s of continuous signing) matches what the model was trained
+   *   on. The server uses the same rule (ModelMeta.window_frames).
+   */
+  constructor(private maxLen: number, private dims = FEATURE_DIM, windowFrames?: number) {
+    this.windowFrames = Math.max(1, Math.min(windowFrames ?? maxLen, maxLen));
+  }
 
   push(vec: Float32Array) {
+    if (vec.length !== this.dims) {
+      throw new Error(`KeypointBuffer expected ${this.dims}-dim frames, got ${vec.length}`);
+    }
     this.frames.push(vec);
-    if (this.frames.length > this.maxLen) this.frames.shift();
+    if (this.frames.length > this.windowFrames) this.frames.shift();
+  }
+
+  /** The raw (un-normalized) frames currently held, oldest first. */
+  rawFrames(): Float32Array[] {
+    return this.frames.slice();
   }
 
   get length() {
@@ -68,6 +88,8 @@ export interface PredictionEvent {
   label: string;
   confidence: number;
   timestamp: number; // seconds since session start
+  /** true once the user has corrected this gloss by hand */
+  edited?: boolean;
 }
 
 export interface SmoothingConfig {
@@ -91,12 +113,19 @@ export interface SmoothingConfig {
    * QUESTION" (repeated raw predictions of one held sign) into a single
    * QUESTION event, and rejects one-off flickers/noise. */
   stableCount: number;
+  /** After this many consecutive NO_SIGN ticks (a pause between signs),
+   * the same label may be committed again. Without this, signing
+   * "HELLO ... HELLO" produced a single HELLO: the repeat guard only reset
+   * when a DIFFERENT label was committed. A held sign (no pause) still
+   * collapses to one event. */
+  repeatGapTicks: number;
 }
 
 export const DEFAULT_SMOOTHING: SmoothingConfig = {
   ignoreThreshold: 0.5,
   acceptThreshold: 0.75,
   stableCount: 3,
+  repeatGapTicks: 4,
 };
 
 /**
@@ -115,6 +144,7 @@ export class SessionSmoother {
   private recentLabel: string | null = null;
   private recentCount = 0;
   private lastCommittedLabel: string | null = null;
+  private noSignTicks = 0;
   private config: SmoothingConfig;
 
   constructor(config: Partial<SmoothingConfig> = {}) {
@@ -144,8 +174,11 @@ export class SessionSmoother {
     if (confidence < this.config.ignoreThreshold) {
       this.recentLabel = null;
       this.recentCount = 0;
+      this.noSignTicks += 1;
+      if (this.noSignTicks >= this.config.repeatGapTicks) this.lastCommittedLabel = null;
       return { status: "no_sign" };
     }
+    this.noSignTicks = 0;
 
     if (confidence < this.config.acceptThreshold) {
       // Uncertain: a soft tick. Deliberately does NOT reset recentLabel/
@@ -185,6 +218,7 @@ export class SessionSmoother {
     this.recentLabel = null;
     this.recentCount = 0;
     this.lastCommittedLabel = null;
+    this.noSignTicks = 0;
   }
 }
 

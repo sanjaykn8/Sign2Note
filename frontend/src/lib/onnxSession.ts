@@ -15,6 +15,10 @@ export function loadOnnxSession(modelBytes: ArrayBuffer): Promise<ort.InferenceS
     sessionPromise = ort.InferenceSession.create(modelBytes, {
       executionProviders: ["wasm"],
     });
+    // A failed load must not be cached forever -- let a retry try again.
+    sessionPromise.catch(() => {
+      sessionPromise = null;
+    });
   }
   return sessionPromise;
 }

@@ -35,26 +35,36 @@ function formatDate(date?: Date): string {
 /** One structured line of the notes, used by both the plain-text formatter
  * and the PDF renderer so the two stay visually consistent. */
 type NoteLine =
-  | { kind: "heading"; text: string }
-  | { kind: "bullet"; text: string }
+  | { kind: "heading"; text: string; level: number }
+  | { kind: "bullet"; text: string; indent: number }
+  | { kind: "numbered"; text: string; number: string; indent: number }
   | { kind: "para"; text: string }
+  | { kind: "rule" }
   | { kind: "blank" };
 
-function parseNoteLines(markdown: string, stripEmphasis = true): NoteLine[] {
+/** Line-level Markdown parse shared by every exporter (and mirrored by
+ * markdown.ts's on-screen renderer) so exports match what is displayed. */
+export function parseNoteLines(markdown: string, stripEmphasis = true): NoteLine[] {
   const lines: NoteLine[] = [];
-  for (const raw of markdown.split("\n")) {
+  const strip = (s: string) =>
+    stripEmphasis ? s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1").replace(/_(.+?)_/g, "$1") : s;
+  for (const raw of markdown.replace(/\r\n?/g, "\n").split("\n")) {
     const line = raw.trimEnd();
-    const stripBold = (s: string) =>
-      stripEmphasis ? s.replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1") : s;
-
-    if (/^#{1,3}\s+/.test(line)) {
-      lines.push({ kind: "heading", text: stripBold(line.replace(/^#{1,3}\s+/, "")) });
-    } else if (/^[-*]\s+/.test(line)) {
-      lines.push({ kind: "bullet", text: stripBold(line.replace(/^[-*]\s+/, "")) });
-    } else if (line.trim().length === 0) {
+    const indent = Math.floor((line.length - line.trimStart().length) / 2);
+    const t = line.trimStart();
+    let m: RegExpMatchArray | null;
+    if ((m = t.match(/^(#{1,6})\s+(.*)$/))) {
+      lines.push({ kind: "heading", level: m[1].length, text: strip(m[2]) });
+    } else if (/^(-{3,}|\*{3,}|_{3,})$/.test(t)) {
+      lines.push({ kind: "rule" });
+    } else if ((m = t.match(/^[-*+]\s+(.*)$/))) {
+      lines.push({ kind: "bullet", indent, text: strip(m[1]) });
+    } else if ((m = t.match(/^(\d+)[.)]\s+(.*)$/))) {
+      lines.push({ kind: "numbered", indent, number: m[1], text: strip(m[2]) });
+    } else if (t.length === 0) {
       lines.push({ kind: "blank" });
     } else {
-      lines.push({ kind: "para", text: stripBold(line.trim()) });
+      lines.push({ kind: "para", text: strip(t) });
     }
   }
   return lines;
@@ -98,7 +108,9 @@ export function markdownToPlainText(markdown: string, meta: ExportMeta = {}): st
 
   for (const line of parseNoteLines(markdown)) {
     if (line.kind === "heading") out.push("", line.text.toUpperCase());
-    else if (line.kind === "bullet") out.push(`\u2022 ${line.text}`);
+    else if (line.kind === "bullet") out.push(`${"  ".repeat(line.indent)}\u2022 ${line.text}`);
+    else if (line.kind === "numbered") out.push(`${"  ".repeat(line.indent)}${line.number}. ${line.text}`);
+    else if (line.kind === "rule") out.push("\u2500".repeat(20));
     else if (line.kind === "blank") out.push("");
     else out.push(line.text);
   }
@@ -107,8 +119,7 @@ export function markdownToPlainText(markdown: string, meta: ExportMeta = {}): st
   return out.join("\n");
 }
 
-export function downloadTextFile(filename: string, content: string, mimeType = "text/plain") {
-  const blob = new Blob([content], { type: `${mimeType};charset=utf-8` });
+function triggerDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -116,7 +127,13 @@ export function downloadTextFile(filename: string, content: string, mimeType = "
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  // Revoking synchronously can cancel the download in Firefox/Safari.
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+export function downloadTextFile(filename: string, content: string, mimeType = "text/plain") {
+  // UTF-8 BOM so Windows editors (Notepad) detect non-ASCII text correctly.
+  triggerDownload(new Blob(["\ufeff", content], { type: `${mimeType};charset=utf-8` }), filename);
 }
 
 export function downloadMarkdown(filename: string, markdown: string) {
@@ -129,7 +146,26 @@ export function downloadPlainText(filename: string, markdown: string, meta: Expo
 
 /** Renders notes to a simple PDF via jsPDF, dynamically imported so the
  * library only loads for users who actually export to PDF. */
+/** Characters jsPDF's built-in Helvetica can draw (WinAnsi / Latin-1 plus
+ * a few typographic marks). Anything else would come out as garbage. */
+export function unsupportedPdfCharacters(text: string): string[] {
+  const bad = new Set<string>();
+  for (const ch of text) {
+    const c = ch.codePointAt(0)!;
+    const ok = c === 10 || c === 13 || c === 9 || (c >= 0x20 && c <= 0x7e) || (c >= 0xa0 && c <= 0xff) ||
+      "\u2013\u2014\u2018\u2019\u201c\u201d\u2022\u2026\u2192\u2500\u20ac".includes(ch);
+    if (!ok) bad.add(ch);
+  }
+  return [...bad];
+}
+
 export async function downloadPdf(filename: string, markdown: string, meta: ExportMeta = {}) {
+  const unsupported = unsupportedPdfCharacters(`${markdown}${meta.title ?? ""}`);
+  if (unsupported.length > 0) {
+    throw new Error(
+      `PDF export uses a Latin-only font and can't show: ${unsupported.slice(0, 8).join(" ")}. Use Word (.docx), Markdown or Text for this content.`
+    );
+  }
   const { jsPDF } = await import("jspdf");
   const doc = new jsPDF({ unit: "pt", format: "a4" });
 
@@ -171,6 +207,13 @@ export async function downloadPdf(filename: string, markdown: string, meta: Expo
       y += 8;
       continue;
     }
+    if (line.kind === "rule") {
+      ensureSpace(12);
+      doc.setDrawColor(210);
+      doc.line(marginX, y, pageWidth - marginX, y);
+      y += 10;
+      continue;
+    }
     if (line.kind === "heading") {
       ensureSpace(24);
       doc.setFont("helvetica", "bold");
@@ -181,10 +224,11 @@ export async function downloadPdf(filename: string, markdown: string, meta: Expo
       continue;
     }
     const isBullet = line.kind === "bullet";
+    const isNumbered = line.kind === "numbered";
     doc.setFont("helvetica", "normal");
     doc.setFontSize(10.5);
-    const prefix = isBullet ? "\u2022  " : "";
-    const indent = isBullet ? 12 : 0;
+    const prefix = isBullet ? "\u2022  " : isNumbered ? `${line.number}.  ` : "";
+    const indent = isBullet || isNumbered ? 12 + 12 * line.indent : 0;
     const wrapped = doc.splitTextToSize(prefix + line.text, maxWidth - indent);
     for (const w of wrapped) {
       ensureSpace(14);
@@ -216,75 +260,89 @@ export function slugify(title: string, fallback = "sign2notes"): string {
 }
 
 /** Builds the `docx` Document object for a set of notes -- separated out
- * from downloadDocx() so tests can construct it directly and inspect the
- * output (via Packer.toBuffer(), etc.) without needing to also exercise
- * the browser download plumbing (URL.createObjectURL / anchor click),
- * which is identical boilerplate to downloadPdf()/downloadTextFile() and
- * doesn't need re-testing here. */
+ * from downloadDocx() so tests can construct it and inspect the output.
+ *
+ * The document body is EXACTLY the notes as shown in the app (headings,
+ * paragraphs, bullet and numbered lists, bold/italic), with nothing added:
+ * no cover page, no logo/author, and no extra title or date block (the
+ * notes already start with their own "# Title"; the previous version
+ * prepended a second title plus a date line that the app never showed).
+ * `meta.title` only sets the file's document-properties title.
+ */
 export async function buildDocxDocument(markdown: string, meta: ExportMeta = {}) {
-  const { Document, Paragraph, TextRun, HeadingLevel } = await import("docx");
+  const { Document, Paragraph, TextRun, HeadingLevel, LevelFormat, AlignmentType } = await import("docx");
 
-  const duration = formatDuration(meta.durationSeconds);
-  const children: InstanceType<typeof Paragraph>[] = [
-    new Paragraph({ text: meta.title || "Lecture Notes", heading: HeadingLevel.TITLE }),
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: `Date: ${formatDate(meta.date)}${duration ? `    Duration: ${duration}` : ""}`,
-          italics: true,
-          color: "666666",
-        }),
-      ],
-    }),
-    new Paragraph({ text: "" }),
+  const headingFor = [
+    HeadingLevel.HEADING_1,
+    HeadingLevel.HEADING_1,
+    HeadingLevel.HEADING_2,
+    HeadingLevel.HEADING_3,
+    HeadingLevel.HEADING_4,
+    HeadingLevel.HEADING_5,
+    HeadingLevel.HEADING_6,
   ];
+  const runs = (text: string) => parseInlineRuns(text).map((r) => new TextRun(r));
+  const children: InstanceType<typeof Paragraph>[] = [];
+  let numberedInstance = 0;
+  let inNumbered = false;
 
   for (const line of parseNoteLines(markdown, /* stripEmphasis */ false)) {
-    if (line.kind === "blank") {
-      children.push(new Paragraph({ text: "" }));
-      continue;
-    }
-    if (line.kind === "heading") {
+    if (line.kind !== "numbered") inNumbered = false;
+    if (line.kind === "blank") continue; // paragraph spacing comes from styles
+    if (line.kind === "rule") {
+      children.push(new Paragraph({ border: { bottom: { style: "single", size: 6, color: "BBBBBB", space: 1 } } }));
+    } else if (line.kind === "heading") {
+      children.push(new Paragraph({ children: runs(line.text), heading: headingFor[line.level] }));
+    } else if (line.kind === "bullet") {
+      children.push(new Paragraph({ children: runs(line.text), bullet: { level: Math.min(line.indent, 8) } }));
+    } else if (line.kind === "numbered") {
+      if (!inNumbered) {
+        numberedInstance += 1; // restart numbering for each separate list
+        inNumbered = true;
+      }
       children.push(
         new Paragraph({
-          children: parseInlineRuns(line.text).map((r) => new TextRun(r)),
-          heading: HeadingLevel.HEADING_2,
+          children: runs(line.text),
+          numbering: { reference: "notes-numbering", level: Math.min(line.indent, 8), instance: numberedInstance },
         })
       );
-      continue;
+    } else {
+      children.push(new Paragraph({ children: runs(line.text) }));
     }
-    children.push(
-      new Paragraph({
-        children: parseInlineRuns(line.text).map((r) => new TextRun(r)),
-        bullet: line.kind === "bullet" ? { level: 0 } : undefined,
-      })
-    );
   }
+  if (children.length === 0) children.push(new Paragraph({ text: "" }));
 
-  return new Document({ sections: [{ children }] });
+  return new Document({
+    title: meta.title || "Sign2Notes notes",
+    creator: "Sign2Notes",
+    numbering: {
+      config: [
+        {
+          reference: "notes-numbering",
+          levels: Array.from({ length: 9 }, (_, level) => ({
+            level,
+            format: LevelFormat.DECIMAL,
+            text: `%${level + 1}.`,
+            alignment: AlignmentType.START,
+            style: { paragraph: { indent: { left: 720 * (level + 1), hanging: 360 } } },
+          })),
+        },
+      ],
+    },
+    sections: [{ children }],
+  });
 }
 
-/**
- * Renders notes to a simple .docx file via the `docx` library, entirely
- * client-side (dynamically imported, same reasoning as jsPDF above --
- * only loads for users who actually export to Word). Deliberately a
- * SIMPLE document, not an elaborate report template: a title, a date/
- * duration line, and the notes themselves as headings/bullets/paragraphs
- * with bold and italic markup preserved as real Word formatting (not
- * stripped, unlike the plain-text/PDF renderers) -- nothing about
- * confidence scores, model versions, or other internal state, since the
- * user didn't ask for that to be in their exported document.
- */
+/** Renders notes to a simple .docx file via the `docx` library, entirely
+ * client-side (dynamically imported -- only loads for users who export). */
 export async function downloadDocx(filename: string, markdown: string, meta: ExportMeta = {}) {
   const { Packer } = await import("docx");
   const doc = await buildDocxDocument(markdown, meta);
-  const blob = await Packer.toBlob(doc);
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
+  triggerDownload(await Packer.toBlob(doc), filename);
+}
+
+/** Filename for an export: "<slug>-YYYY-MM-DD.<ext>". */
+export function exportFilename(title: string, ext: string, date = new Date()): string {
+  const d = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  return `${slugify(title)}-${d}.${ext}`;
 }

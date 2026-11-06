@@ -4,12 +4,37 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import PrivacyBanner from "@/components/PrivacyBanner";
 import NotesPanel from "@/components/NotesPanel";
-import { generateNotesFromGlosses, generateTranscriptFromGlosses, type NotesMode } from "@/lib/api";
+import RecognizerStatus from "@/components/RecognizerStatus";
+import {
+  generateNotesFromGlosses,
+  generateTranscriptFromGlosses,
+  type GenerationMeta,
+  type NoteStyle,
+  type NotesMode,
+} from "@/lib/api";
 import { useSignRecognitionSession, type RecognitionSource } from "@/lib/useSignRecognitionSession";
 import {
-  Camera, Monitor, Square, Play, Pause as PauseIcon, Trash2, AlertTriangle,
-  Hand, Pencil, Check, X, Undo2, MessageSquareText, RotateCcw, Sparkles,
+  Camera, Monitor, Square, Play, Pause as PauseIcon, AlertTriangle,
+  Hand, Check, X, Undo2, MessageSquareText, RotateCcw, Sparkles,
 } from "lucide-react";
+
+/** Markdown document for the final transcript: the recognized gloss
+ * transcript (what the recognizer produced, in order) followed by the
+ * generated natural-language transcript. This exact text is what the
+ * transcript panel shows and exports. */
+export function buildTranscriptDocument(glosses: string[], transcript: string): string {
+  return [
+    "# Live Transcription",
+    "",
+    "## Recognized gloss transcript",
+    "",
+    glosses.join(" \u2192 "),
+    "",
+    "## Natural-language transcript",
+    "",
+    transcript,
+  ].join("\n");
+}
 
 /**
  * Live Transcription mode (Mode 3): USER SIGNS -> recognition -> stable
@@ -33,7 +58,7 @@ type GenPhase = "idle" | "stopping" | "generating" | "completed" | "error";
 export default function LiveTranscription() {
   const session = useSignRecognitionSession();
   const {
-    videoRef, canvasRef, cameraState, cameraError, modelState, modelError,
+    videoRef, canvasRef, cameraState, cameraError, modelState,
     sessionActive, paused, current, history, editingIndex, editDraft, setEditDraft,
     startSession, stopSession, pauseSession, resumeSession, clearSession,
     undoLast, deleteEvent, startEdit, saveEdit, cancelEdit, screenCaptureSupported,
@@ -41,6 +66,10 @@ export default function LiveTranscription() {
 
   const [source, setSource] = useState<RecognitionSource>("webcam");
   const [notesMode, setNotesMode] = useState<NotesMode>("template");
+  const [style, setStyle] = useState<NoteStyle>("concise");
+  const [frozenConfidences, setFrozenConfidences] = useState<number[] | undefined>(undefined);
+  const [transcriptGen, setTranscriptGen] = useState<GenerationMeta | undefined>(undefined);
+  const [notesGen, setNotesGen] = useState<GenerationMeta | undefined>(undefined);
   const [genPhase, setGenPhase] = useState<GenPhase>("idle");
   const [genError, setGenError] = useState<string | null>(null);
   const [frozenGlosses, setFrozenGlosses] = useState<string[]>([]);
@@ -55,16 +84,24 @@ export default function LiveTranscription() {
     await startSession(source);
   };
 
-  const runGeneration = async (glosses: string[]) => {
+  // The ONLY place language generation is called in this mode: once, after
+  // the user stops (or retries). Nothing is generated while signing.
+  const runGeneration = async (glosses: string[], confidences?: number[]) => {
     setGenPhase("generating");
     setGenError(null);
     const [transcriptResult, notesResult] = await Promise.allSettled([
-      generateTranscriptFromGlosses(glosses, { notesMode }),
-      generateNotesFromGlosses(glosses, { notesMode }),
+      generateTranscriptFromGlosses(glosses, { notesMode, confidences }),
+      generateNotesFromGlosses(glosses, { notesMode, style, confidences }),
     ]);
 
-    if (transcriptResult.status === "fulfilled") setTranscript(transcriptResult.value.transcript);
-    if (notesResult.status === "fulfilled") setNotes(notesResult.value.notes_md);
+    if (transcriptResult.status === "fulfilled") {
+      setTranscript(transcriptResult.value.transcript);
+      setTranscriptGen(transcriptResult.value.generation);
+    }
+    if (notesResult.status === "fulfilled") {
+      setNotes(notesResult.value.notes_md);
+      setNotesGen(notesResult.value.generation);
+    }
 
     if (transcriptResult.status === "rejected" && notesResult.status === "rejected") {
       // Section 31: keep the session, not lose it -- glosses stay in
@@ -83,20 +120,22 @@ export default function LiveTranscription() {
     setGenPhase("stopping");
     setGenError(null);
     const glosses = history.map((e) => e.label);
+    const confidences = history.map((e) => (e.edited ? 1 : e.confidence));
     stopSession();
     setFrozenGlosses(glosses);
+    setFrozenConfidences(confidences);
 
     if (glosses.length === 0) {
       setGenError("No signs were recognized during this session -- nothing to generate.");
       setGenPhase("error");
       return;
     }
-    await runGeneration(glosses);
+    await runGeneration(glosses, confidences);
   };
 
   const handleRetry = async () => {
     if (genPhase === "generating" || frozenGlosses.length === 0) return;
-    await runGeneration(frozenGlosses);
+    await runGeneration(frozenGlosses, frozenConfidences);
   };
 
   const handleStartNewSession = () => {
@@ -123,15 +162,7 @@ export default function LiveTranscription() {
       </div>
 
       <PrivacyBanner variant="transcription" />
-
-      {modelState === "error" && (
-        <Card className="border-destructive/40 bg-destructive/5">
-          <CardContent className="flex items-start gap-2 py-4 text-sm">
-            <AlertTriangle className="h-4 w-4 shrink-0 text-destructive mt-0.5" />
-            <span>{modelError}</span>
-          </CardContent>
-        </Card>
-      )}
+      <RecognizerStatus session={session} />
 
       {!isLive && genPhase === "idle" && (
         <Card>
@@ -163,8 +194,10 @@ export default function LiveTranscription() {
                 transcribing sign-language content already playing on your device.
               </span>
             )}
-            {!screenCaptureSupported && source === "screen" && (
-              <span className="text-xs text-amber-600">Screen/tab capture isn't supported in this browser.</span>
+            {!screenCaptureSupported && (
+              <span className="text-xs text-muted-foreground">
+                Screen/tab capture isn't available in this browser (typical on phones and tablets) — use the webcam.
+              </span>
             )}
           </CardContent>
         </Card>
@@ -218,6 +251,15 @@ export default function LiveTranscription() {
                         variant="secondary"
                         className={`text-sm px-3 py-1 ${genPhase === "idle" ? "cursor-pointer hover:bg-secondary/70" : ""}`}
                         onClick={() => genPhase === "idle" && startEdit(i)}
+                        onKeyDown={(ev) => {
+                          if (genPhase === "idle" && (ev.key === "Enter" || ev.key === " ")) {
+                            ev.preventDefault();
+                            startEdit(i);
+                          }
+                        }}
+                        role={genPhase === "idle" ? "button" : undefined}
+                        tabIndex={genPhase === "idle" ? 0 : undefined}
+                        aria-label={genPhase === "idle" ? `Edit gloss ${label}` : undefined}
                       >
                         {label}
                       </Badge>
@@ -225,8 +267,8 @@ export default function LiveTranscription() {
                     {genPhase === "idle" && editingIndex !== i && (
                       <button
                         onClick={() => deleteEvent(i)}
-                        className="opacity-0 transition-opacity group-hover:opacity-100 text-muted-foreground hover:text-destructive"
-                        aria-label="Delete"
+                        className="rounded transition-opacity text-muted-foreground hover:text-destructive focus:opacity-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:opacity-0 sm:group-hover:opacity-100"
+                        aria-label={`Delete gloss ${label}`}
                       >
                         <X className="h-3.5 w-3.5" />
                       </button>
@@ -301,12 +343,23 @@ export default function LiveTranscription() {
                   </Button>
                 )}
                 <select
+                  aria-label="Text generator"
                   value={notesMode}
                   onChange={(e) => setNotesMode(e.target.value as NotesMode)}
                   className="rounded-lg border bg-background px-2 py-1 text-xs"
                 >
                   <option value="template">Deterministic</option>
                   <option value="llm">Local LLM</option>
+                </select>
+                <select
+                  aria-label="Notes style"
+                  value={style}
+                  onChange={(e) => setStyle(e.target.value as NoteStyle)}
+                  className="rounded-lg border bg-background px-2 py-1 text-xs"
+                >
+                  <option value="concise">Concise notes</option>
+                  <option value="detailed">Detailed notes</option>
+                  <option value="academic">Academic notes</option>
                 </select>
               </>
             )}
@@ -351,20 +404,14 @@ export default function LiveTranscription() {
       )}
 
       {transcript && (
-        <Card>
-          <CardHeader className="pb-2">
-            <CardTitle className="text-base flex items-center gap-2">
-              <MessageSquareText className="h-5 w-5 text-primary" />
-              Natural-Language Transcript
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <p className="text-sm leading-relaxed whitespace-pre-line">{transcript}</p>
-          </CardContent>
-        </Card>
+        <NotesPanel
+          markdown={buildTranscriptDocument(frozenGlosses, transcript)}
+          title="Live Transcription Transcript"
+          generation={transcriptGen}
+        />
       )}
 
-      {notes && <NotesPanel markdown={notes} title="Live Transcription Notes" />}
+      {notes && <NotesPanel markdown={notes} title="Live Transcription Notes" generation={notesGen} />}
 
       {(genPhase === "completed" || genPhase === "error") && (
         <Button onClick={handleStartNewSession} variant="outline">
