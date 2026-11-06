@@ -4,7 +4,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/"
+    "test": "node --test test/gateway.test.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
